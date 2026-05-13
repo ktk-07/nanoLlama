@@ -1,3 +1,4 @@
+# Pytorch's Implementation Llama, Llama2 and Llama3
 import torch
 from torch import nn
 import torch.nn.function as F
@@ -118,19 +119,19 @@ class MultiheadSelfAttention(nn.Module):
         self.linear_o = nn.Linear(in_features=d_k, out_features=d_model)
         self.rope = RotaryPositionEmbedding(max_seq_len=max_seq_len, head_dim=self.head_dim, base=10000)
 
-    def forward(self, Q : torch.Tensor, K : torch.Tensor, V : torch.Tensor, mask : torch.Tensor = None):
+    def forward(self, x : torch.Tensor, mask : torch.Tensor = None):
         B, max_seq_len, d_model = Q.shape
         assert d_model % self.h == 0 , f"Hidden Dimensions {d_model} not divisible by num of heads {self.h}"
 
-        Q = self.linear_q(Q)
+        Q = self.linear_q(x)
         Q = Q.reshape(B, max_seq_len, self.h, d_model // self.h).permute(0,2,1,3)
-        K = self.linear_q(K)
+        K = self.linear_q(x)
         K = K.reshape(B, max_seq_len, self.h, d_model // self.h).permute(0,2,1,3)
         # Apply RoPE to Q and K
         Q = self.rope(Q)
         K = self.rope(K)
 
-        V = self.linear_q(V)
+        V = self.linear_q(x)
         V = V.reshape(B, max_seq_len, self.h, d_model // self.h).permute(0,2,1,3)
 
         attn_score, attn_weights = scaled_dot_product_attention(Q=Q, K=K, V=V, mask=mask)
@@ -139,12 +140,45 @@ class MultiheadSelfAttention(nn.Module):
 
         return mhsa_output, attn_weights
 
+# GQA:Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints https://arxiv.org/pdf/2305.13245
+# Each qroup of query heads is attached to 1 set of K and V heads
 class GroupQueryAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, h, g, d_model):
         super().__init__()
-        pass
-    def forward(self, x : torch.Tensor):
-        pass
+        assert d_model % h == 0, "Embedding Dimension must be divisible by H"
+        assert h % g == 0, "Total Number of heads must be divisible by number of heads in group"
+        self.h = h # Total no of heads
+        self.g = g # Group Size aka no of heads in the group
+        self.head_dim = d_model // self.h
+        self.num_of_groups = self.g // self.h
+        self.linear_q = nn.Linear(in_features=d_model,out_features=d_model, bias=False)
+        self.linear_k = nn.Linear(in_features=d_model,out_features=self.head_dim * self.num_of_groups, bias=False)
+        self.linear_v = nn.Linear(in_features=d_model,out_features=self.head_dim * self.num_of_groups bias=False)
+        self.linear_o = nn.Linear(in_features=self.head_dim * self.num_of_groups,out_features=d_model, bias=False)
+        self.rope = RotaryPositionEmbedding(max_seq_len=max_seq_len, head_dim=self.head_dim, base=10000)
+
+    def forward(self, x : torch.Tensor, mask : torch.Tensor = None):
+        # input : batch x max_seq_len x d_model
+        Q = self.linear_q(x)
+        Q = Q.reshape(B, max_seq_len, self.num_of_groups, self.head_dim * self.g).permute(0,2,1,3) # batch_size x num_of_groups x max_seq_len x self.head_dim * self.g
+        
+        K = self.linear_k(x) # batch x max_seq_len x head_dim
+        K = K.unsqueeze(0).permute(0,2,1,3) # batch_size x num_of_groups x max_seq_len x self.head_dim
+        K = K.repeat(1,1,1,self.g) # batch_size x 1 x max_seq_len x self.head_dim * self.g
+
+
+        # Apply RoPE to Q and K
+        Q = self.rope(Q)
+        K = self.rope(K)
+
+        V = self.linear_v(x) # batch x max_seq_len x head_dim
+        V = V.unsqueeze(0).permute(0,2,1,3) # batch_size x num_of_groups x max_seq_len x self.head_dim
+        V = V.repeat(1,1,1,self.g) # batch_size x 1 x max_seq_len x self.head_dim * self.g
+
+        attn_score, attn_weights = scaled_dot_product_attention(Q=Q, K=K, V=V, mask=mask)
+        attn_score_reshaped = attn_score.permute(0,2,1,3).reshape(B, max_seq_len, d_model)
+        mhsa_output = self.linear_o(attn_score_reshaped)
+        return mhsa_output, attn_weights
 
 # Attention is all you need https://arxiv.org/abs/1706.03762
 # Architecture is the same as the decoder used in the original attention paper
@@ -180,6 +214,11 @@ class Llama(nn.Module):
 # Recap LLama2
 # Decoder Only
 # Tokenizer Tiktoken
+class Llama2Decoder(nn.Module):
+    def __init__(self, max_seq_len, h=32, d_model=4096, d_ff=11008):
+        pass
+    def forward(self, x : torch.Tensor):
+        pass
 
 class Llama2(nn.Module):
     def __init__(self):
