@@ -56,20 +56,6 @@ class RotaryPositionEmbedding(nn.Module):
         output[:, 1::2, :] = actual_y  
         return output
 
-class FFNSwiGLU(nn.Module):
-    def __init__(self, d_model, d_ff):
-        super().__init__()
-        # We need Value and Gate Branch
-        # SwiGLU = Swish(W2*x + A) * (W1*x + B)
-        # W1 - value_branch, W2 - gate_branch
-        self.value_branch = nn.Linear(d_model, d_ff)
-        self.gate_branch = nn.Linear(d_model, d_ff) 
-        self.sigmoid = nn.Sigmoid()
-    def forward(self, x : torch.Tensor):
-        # We can use F.silu(x) it is the same as swish(x)
-        gate_output = self.gate_branch(x)
-        return self.value_branch(x) * (gate_output * self.sigmoid(gate_output))
-
 # Root Mean Square Layer Normalization https://arxiv.org/pdf/1910.07467
 class RMSNorm(nn.Module):
     def __init__(self, d_model):
@@ -212,27 +198,47 @@ class Llama(nn.Module):
         self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding_dim=d_model)
         self.decoders = nn.ModuleList([LlamaDecoder(max_seq_len=max_seq_len, h=h, d_model=d_model, d_ff) for _ in range(n)])
 
-    def forward(self, x; torch.Tensor, mask : torch.Tensor = None):
+    def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
         output = self.tkn_embedding(x)
         for idx,layer in emuerate(self.decoders):
             output = layer(output, mask=mask)
 
-# Recap LLama2
+        return output
+
+# LLAMA 2: Open Foundation and Fine-Tuned Chat Models https://arxiv.org/pdf/2307.09288
+# Similar Architecturally to Llama, only difference is GQA instead of MHA
+# PreNorm, RoPE, SwiGLU 
 # Decoder Only
-# Tokenizer Tiktoken
+# Tokenizer still Byte Pair Encoding implemented by SentencePiece
 class Llama2Decoder(nn.Module):
-    def __init__(self, max_seq_len, h=32, d_model=4096, d_ff=11008):
-        pass
+    def __init__(self, max_seq_len, h=32, g=6, d_model=4096, d_ff=11008):
+        super().__init__()
+        self.ffn = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
+        self.gqa = GroupQueryAttention(max_seq_len=max_seq_len, h=h, g=g, dmodel=d_model)
+        self.rms_norm1 = RMSNorm(d_model=d_model)
+        self.rms_norm2 = RMSNorm(d_model=d_model)
     def forward(self, x : torch.Tensor):
-        pass
+        norm_x = self.rms_norm1(x)
+        gqa_output, attn_weights = self.gqa(norm_x)
+        rms2_input = gqa_output + x
+        ffn_input = self.rms_norm2(rms2_input)
+        ffn_output = self.ffn(ffn_input)
+        output = ffn_output + rms2_input
+        return output
 
 class Llama2(nn.Module):
-    def __init__(self):
+    def __init__(self, max_seq_len, n=32, h=32, g=6,d_model=4096, d_ff=11008):
         super().__init__()
-        pass
-    def forward(self):
-        pass
+        self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding
+        self.decoders = nn.ModuleList([Llama2Decoder(max_seq_len, h=h, g=g,d_model=d_model, d_ff=d_ff)
+ for _ in range(n)])
+    
+    def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
+        output = self.tkn_embedding(x)
+        for idx,layer in emuerate(self.decoders):
+            output = layer(output, mask=mask)
 
+        return output
 
 @dataclass
 class LlamaConfig:
