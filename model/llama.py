@@ -15,6 +15,18 @@ from .utils import scaled_dot_product_attention, generate_matrixes_for_rope
 # Optimizer
 # 6.7B 4096 32 32 3.0e−4 4M 1.0T
 
+@dataclass
+class LlamaConfig:
+    vocab_size: int
+    dim: int
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    max_seq_len: int
+    intermediate_size: int
+    rope_theta: float = 10000.0
+    norm_eps: float = 1e-5
+
 # RoFormer: Enhanced Transformer with Rotary Postion Embedding https://arxiv.org/pdf/2104.09864
 # Think it as applying rotation to every pair of dimensions
 def generate_theta_for_rope(d_model, base=10000):
@@ -58,10 +70,10 @@ class RotaryPositionEmbedding(nn.Module):
 
 # Root Mean Square Layer Normalization https://arxiv.org/pdf/1910.07467
 class RMSNorm(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, eps=1e-5):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(1,1,d_model))
-        self.eps = 1e-7
+        self.eps = eps
     def forward(self, x : torch.Tensor):
         rms_val = x.pow(2).mean(dim=-1,keep_dim=True)
         output = x / torch.sqrt(rms_val + self.eps)
@@ -90,7 +102,7 @@ class FFNSwiGLU(nn.Module):
         gate_output = self.gate_branch(x)
         return self.w(self.value_branch(x) * (gate_output * self.sigmoid(gate_output)))
 
-
+# We can change the code so that it accomodates MHA, MQA, GQA
 # RoFormer: Enhanced Transformer with Rotary Position Embedding https://arxiv.org/pdf/2104.09864 RoPE is applied here
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, max_seq_len, h = 32, d_model = 4096, d_k = 4096):
@@ -126,12 +138,12 @@ class MultiheadSelfAttention(nn.Module):
 
         return mhsa_output, attn_weights
 
-# GQA:Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints https://arxiv.org/pdf/2305.13245
-# 2 main idea to this GQA paper.
-# 1. Converting MHA into GQA, which is called uptraining
-# 2. Introduces Grouped-query attention which divides query heads into G groups, where each G groups shares 1 single k and v head. GQA-1 == MQA
-class GroupQueryAttention(nn.Module):
-    def __init__(self, max_seq_len, h, g, d_model):
+# MQA: Fast Transformer Decoding: One Write-Head is All You Need https://arxiv.org/pdf/1911.02150
+# Main idea: All the query head, share the same key and value head
+# This is because the main bottleneck is the memory-bandwidth cost of repeatedly loading large key and value tensors.
+
+class MQA(nn.Module):
+    def __init__(self, max_seq_len=4096, h=32, g=1, d_model=4096):
         super().__init__()
         assert d_model % h == 0, "Embedding Dimension must be divisible by H"
         assert h % g == 0, "Total Number of heads must be divisible by number of group"
@@ -172,36 +184,125 @@ class GroupQueryAttention(nn.Module):
         mhsa_output = self.linear_o(attn_score_reshaped)
         return mhsa_output, attn_weights
 
+# GQA:Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints https://arxiv.org/pdf/2305.13245
+# 2 main idea to this GQA paper.
+# 1. Converting MHA into GQA, which is called uptraining
+# 2. Introduces Grouped-query attention which divides query heads into G groups, where each G groups shares 1 single k and v head. GQA-1 == MQA
+class GroupQueryAttention(nn.Module):
+    def __init__(self, max_seq_len=4096, h=32, g=8, d_model=4096):
+        super().__init__()
+        assert d_model % h == 0, "Embedding Dimension must be divisible by H"
+        assert h % g == 0, "Total Number of heads must be divisible by number of group"
+        self.h = h # Total no of heads
+        self.g = g # Number of groups
+        self.head_dim = d_model // self.h # Head Dimension
+        self.num_of_heads = self.h // self.g # Number of heads in a group
+        self.linear_q = nn.Linear(in_features=d_model,out_features=d_model, bias=False)
+        self.linear_k = nn.Linear(in_features=d_model,out_features=self.head_dim * self.g, bias=False)
+        self.linear_v = nn.Linear(in_features=d_model,out_features=self.head_dim * self.g, bias=False)
+        self.linear_o = nn.Linear(in_features=d_model,out_features=d_model, bias=False)
+        self.rope = RotaryPositionEmbedding(max_seq_len=max_seq_len, head_dim=self.head_dim, base=10000)
+
+    def forward(self, x : torch.Tensor, mask : torch.Tensor = None):
+        # input : batch x max_seq_len x d_model
+        B, max_seq_len, d_model = x.shape
+        Q = self.linear_q(x)
+        Q = Q.reshape(B, max_seq_len, self.h, self.head_dim).permute(0,2,1,3) # batch_size x num_of_heas x max_seq_len x self.head_dim
+        # The reason why we do this is because we need each query head to be independent
+
+        K = self.linear_k(x) # batch x max_seq_len x head_dim
+        K = K.reshape(B, max_seq_len, self.g, self.head_dim).permute(0,2,1,3) # batch_size x num_of_groups x max_seq_len x self.head_dim
+
+        # Apply RoPE to Q and K
+        Q = self.rope(Q)
+        K = self.rope(K)
+
+        V = self.linear_v(x) # batch x max_seq_len x head_dim
+        V = V.reshape(B, max_seq_len, self.g, self.head_dim).permute(0,2,1,3) # batch_size x num_of_groups x max_seq_len x self.head_dim
+
+        # Important to use repeat_interleave instead of repeat to match group strucutre
+        K = K.repeat_interleave(self.num_of_heads,dim=1) # B x self.h x max_seq_len x self.head_dim
+        V = V.repeat_interleave(self.num_of_heads,dim=1) # B x self.h x max_seq_len x self.head_dim
+
+        # input B x self.h x max_seq_len x self.head_dim
+        attn_score, attn_weights = scaled_dot_product_attention(Q=Q, K=K, V=V, mask=mask)
+        attn_score_reshaped = attn_score.permute(0,2,1,3).reshape(B, max_seq_len, d_model)
+        mhsa_output = self.linear_o(attn_score_reshaped)
+        return mhsa_output, attn_weights
+
+# Combining MSA, GQA and MQA into 1 module
+class Attention(nn.Module):
+    def __init__(self, n_heads, n_kv_heads, max_seq_len, d_model):
+        super().__init__()
+        assert d_model % n_heads == 0, "Embedding dim is not divisible by number of heads"
+        assert n_heads % n_kv_heads == 0, "Unable to obtain group side, n_heads not divisible"
+        self.head_dim = d_model // n_heads
+        self.g = n_heads // n_kv_heads
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.linear_q = nn.Linear(in_features=d_model, out_features=d_model, bias=False) 
+        self.linear_k = nn.Linear(in_features=d_model, out_features=n_kv_heads * self.head_dim, bias=False)
+        self.linear_v = nn.Linear(in_features=d_model, out_features=n_kv_heads * self.head_dim, bias=False)
+        self.linear_o = nn.Linear(in_features=d_model, out_features=d_model)
+        self.rope = RotaryPositionEmbedding(max_seq_len=max_seq_len, head_dim=self.head_dim, base=10000)
+
+
+    def forward(self, x: torch.Tensor, mask: torch,Tensor = None):
+        B, max_seq_len, d_model = x.shape
+        Q = self.linear_q(x)
+        Q = Q.reshape(B,max_seq_len,self.n_heads,self.head_dim).permute(0,2,1,3)
+        
+        K = self.linear_k(x)
+        K = K.reshape(B,max_seq_len,self.n_kv_heads,self.head_dim).permute(0,2,1,3)
+
+        # Apply RoPE to Q and K
+        Q = self.rope(Q)
+        K = self.rope(K)
+
+        V = self.linear_v(x)
+        V = V.reshape(B,max_seq_len,self.n_kv_heads,self.head_dim).permute(0,2,1,3)
+
+        K = torch.repeat_interleave(K,repeats = self.g, dim=1)
+        V = torch.repeat_interleave(V,repeats = self.g, dim=1)
+
+        mhsa_output,attn_weights = scaled_dot_product_attn(Q=Q,K=K,V=V,mask=mask)
+        concat_output = mhsa_output.permute(0,2,1,3).reshape(B,max_seq_len, d_model)
+        output = self.linear_o(mhsa_output) 
+
+        return output
+
 # Attention is all you need https://arxiv.org/abs/1706.03762
 # Architecture is the same as the decoder used in the original attention paper
 # PreNorm Used instead of PostNorm, but residual streams should stay unnormalized
 class LlamaDecoder(nn.Module):
-    def __init__(self, max_seq_len, h=32, d_model=4096, d_ff=11008):
+    def __init__(self, max_seq_len=2048, h=32, d_model=4096, d_ff=11008):
         super().__init__()
-        self.ffn = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
-        self.msa = MultiheadSelfAttention(max_seq_len=max_seq_len, h=h, d_model=d_model)
-        self.rms_norm = RMSNorm(d_model=d_model):
-        self.rms_norm2 = RMSNorm(d_model=d_model): 
+        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
+        self.self_attn = Attention(max_seq_len=max_seq_len, h=h, d_model=d_model)
+        self.input_layernorm = RMSNorm(d_model=d_model)
+        self.post_attention_layernorm = RMSNorm(d_model=d_model)
 
     def forward(self, x : torch.Tensor):
-        norm_x = self.rms_norm(x)
-        mhsa_output, attn_weights = self.msa(norm_x)
+        norm_x = self.input_layernorm(x)
+        mhsa_output, attn_weights = self.self_attn(norm_x)
         rms2_input = mhsa_output + x
-        ffn_input = self.rms_norm2(rms2_input)
-        ffn_output = self.ffn(ffn_input)
+        ffn_input = self.post_attention_layernorm(rms2_input)
+        ffn_output = self.mlp(ffn_input)
         output = ffn_output + rms2_input
         return output
 
 class Llama(nn.Module):
-    def __init__(self, max_seq_len, n=32, h=32, d_model=4096, d_ff=11008):
+    def __init__(self, max_seq_len=2048, n=32, h=32, d_model=4096, d_ff=11008):
         super().__init__()
         self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding_dim=d_model)
         self.decoders = nn.ModuleList([LlamaDecoder(max_seq_len=max_seq_len, h=h, d_model=d_model, d_ff) for _ in range(n)])
+        self.lm_head = nn.Linear(in_features,out_features=vocab_size)
 
     def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
         output = self.tkn_embedding(x)
         for idx,layer in emuerate(self.decoders):
             output = layer(output, mask=mask)
+        output = self.lm_head(output)
 
         return output
 
@@ -210,39 +311,39 @@ class Llama(nn.Module):
 # PreNorm, RoPE, SwiGLU 
 # Decoder Only
 # Tokenizer still Byte Pair Encoding implemented by SentencePiece
+# GQA is only applied to 34B and 70B models
 class Llama2Decoder(nn.Module):
-    def __init__(self, max_seq_len, h=32, g=6, d_model=4096, d_ff=11008):
+    def __init__(self, max_seq_len=4096, h=32, g=6, d_model=4096, d_ff=11008, isGQA=False):
         super().__init__()
-        self.ffn = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
-        self.gqa = GroupQueryAttention(max_seq_len=max_seq_len, h=h, g=g, dmodel=d_model)
-        self.rms_norm1 = RMSNorm(d_model=d_model)
-        self.rms_norm2 = RMSNorm(d_model=d_model)
+        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
+        self.self_attn = Attention()
+        if isGQA:
+            self.self_attn = GroupQueryAttention(max_seq_len=max_seq_len, h=h, g=g, dmodel=d_model)
+        else:
+            self.self_attn = MultiheadSelfAttention(max_seq_len=max_seq_len, h=h, d_model=d_model)
+        self.input_layernorm = RMSNorm(d_model=d_model)
+        self.post_attention_layernorm = RMSNorm(d_model=d_model)
     def forward(self, x : torch.Tensor):
-        norm_x = self.rms_norm1(x)
-        gqa_output, attn_weights = self.gqa(norm_x)
+        norm_x = self.input_layernorm(x)
+        gqa_output, attn_weights = self.self_attn(norm_x)
         rms2_input = gqa_output + x
-        ffn_input = self.rms_norm2(rms2_input)
-        ffn_output = self.ffn(ffn_input)
+        ffn_input = self.post_attention_layernorm(rms2_input)
+        ffn_output = self.mlp(ffn_input)
         output = ffn_output + rms2_input
         return output
 
 class Llama2(nn.Module):
-    def __init__(self, max_seq_len, n=32, h=32, g=6,d_model=4096, d_ff=11008):
+    def __init__(self, max_seq_len=4096, n=32, h=32, g=6, d_model=4096, d_ff=11008, vocab_size=):
         super().__init__()
         self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding
         self.decoders = nn.ModuleList([Llama2Decoder(max_seq_len, h=h, g=g,d_model=d_model, d_ff=d_ff)
  for _ in range(n)])
-    
+        self.lm_head = nn.Linear(in_features,out_features=vocab_size)
+
     def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
         output = self.tkn_embedding(x)
         for idx,layer in emuerate(self.decoders):
             output = layer(output, mask=mask)
 
+        output = self.lm_head(output)
         return output
-
-@dataclass
-class LlamaConfig:
-    pass
-
-class Llama2Config:
-    pass
