@@ -247,7 +247,7 @@ class Attention(nn.Module):
         self.rope = RotaryPositionEmbedding(max_seq_len=max_seq_len, head_dim=self.head_dim, base=10000)
 
 
-    def forward(self, x: torch.Tensor, mask: torch,Tensor = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         B, max_seq_len, d_model = x.shape
         Q = self.linear_q(x)
         Q = Q.reshape(B,max_seq_len,self.n_heads,self.head_dim).permute(0,2,1,3)
@@ -265,7 +265,7 @@ class Attention(nn.Module):
         K = torch.repeat_interleave(K,repeats = self.g, dim=1)
         V = torch.repeat_interleave(V,repeats = self.g, dim=1)
 
-        mhsa_output,attn_weights = scaled_dot_product_attn(Q=Q,K=K,V=V,mask=mask)
+        mhsa_output,attn_weights = scaled_dot_product_attention(Q=Q,K=K,V=V,mask=mask)
         concat_output = mhsa_output.permute(0,2,1,3).reshape(B,max_seq_len, d_model)
         output = self.linear_o(mhsa_output) 
 
@@ -277,7 +277,7 @@ class Attention(nn.Module):
 class LlamaDecoder(nn.Module):
     def __init__(self, max_seq_len=2048, h=32, d_model=4096, d_ff=11008):
         super().__init__()
-        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
+        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff)
         self.self_attn = Attention(max_seq_len=max_seq_len, h=h, d_model=d_model)
         self.input_layernorm = RMSNorm(d_model=d_model)
         self.post_attention_layernorm = RMSNorm(d_model=d_model)
@@ -292,15 +292,15 @@ class LlamaDecoder(nn.Module):
         return output
 
 class Llama(nn.Module):
-    def __init__(self, max_seq_len=2048, n=32, h=32, d_model=4096, d_ff=11008):
+    def __init__(self, vocab_size,max_seq_len=2048, n=32, h=32, d_model=4096, d_ff=11008):
         super().__init__()
         self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding_dim=d_model)
-        self.decoders = nn.ModuleList([LlamaDecoder(max_seq_len=max_seq_len, h=h, d_model=d_model, d_ff) for _ in range(n)])
-        self.lm_head = nn.Linear(in_features,out_features=vocab_size)
+        self.decoders = nn.ModuleList([LlamaDecoder(max_seq_len=max_seq_len, h=h, d_model=d_model, d_ff=d_ff) for _ in range(n)])
+        self.lm_head = nn.Linear(in_features=d_model,out_features=vocab_size)
 
-    def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
+    def forward(self, x :torch.Tensor, mask : torch.Tensor = None):
         output = self.tkn_embedding(x)
-        for idx,layer in emuerate(self.decoders):
+        for idx,layer in enumerate(self.decoders):
             output = layer(output, mask=mask)
         output = self.lm_head(output)
 
@@ -313,14 +313,10 @@ class Llama(nn.Module):
 # Tokenizer still Byte Pair Encoding implemented by SentencePiece
 # GQA is only applied to 34B and 70B models
 class Llama2Decoder(nn.Module):
-    def __init__(self, max_seq_len=4096, h=32, g=6, d_model=4096, d_ff=11008, isGQA=False):
+    def __init__(self, vocab_size, max_seq_len=4096, n_heads=32, n_kv_heads=6, d_model=4096, d_ff=11008):
         super().__init__()
-        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff):
-        self.self_attn = Attention()
-        if isGQA:
-            self.self_attn = GroupQueryAttention(max_seq_len=max_seq_len, h=h, g=g, dmodel=d_model)
-        else:
-            self.self_attn = MultiheadSelfAttention(max_seq_len=max_seq_len, h=h, d_model=d_model)
+        self.mlp = FFNSwiGLU(d_model=d_model, d_ff=d_ff)
+        self.self_attn = Attention( n_heads=n_heads, n_kv_heads=n_kv_heads, max_seq_len=max_seq_len, d_model=d_model)
         self.input_layernorm = RMSNorm(d_model=d_model)
         self.post_attention_layernorm = RMSNorm(d_model=d_model)
     def forward(self, x : torch.Tensor):
@@ -333,16 +329,16 @@ class Llama2Decoder(nn.Module):
         return output
 
 class Llama2(nn.Module):
-    def __init__(self, max_seq_len=4096, n=32, h=32, g=6, d_model=4096, d_ff=11008, vocab_size=):
+    def __init__(self, vocab_size, max_seq_len=4096, n=32, h=32, g=6, d_model=4096, d_ff=11008):
         super().__init__()
-        self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding
+        self.tkn_embedding = nn.Embedding(num_embeddings=vocab_size,embedding_dim=d_model)
         self.decoders = nn.ModuleList([Llama2Decoder(max_seq_len, h=h, g=g,d_model=d_model, d_ff=d_ff)
  for _ in range(n)])
-        self.lm_head = nn.Linear(in_features,out_features=vocab_size)
+        self.lm_head = nn.Linear(in_features=d_model,out_features=vocab_size)
 
-    def forward(self, x, torch.Tensor, mask : torch.Tensor = None):
+    def forward(self, x :torch.Tensor, mask : torch.Tensor = None):
         output = self.tkn_embedding(x)
-        for idx,layer in emuerate(self.decoders):
+        for idx,layer in enumerate(self.decoders):
             output = layer(output, mask=mask)
 
         output = self.lm_head(output)
