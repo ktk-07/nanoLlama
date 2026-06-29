@@ -4,6 +4,8 @@ from torch import nn
 import torch.nn.functional as F
 from .utils.model_utilities import scaled_dot_product_attention
 
+# I have not integrated this the models with KV-caching
+
 # Llama Implementation https://github.com/meta-llama/llama/blob/main/llama/model.py?utm_source=chatgpt.com
 # Recap Llama
 # Tokenizer is SentencePiece's BytePairEncoding
@@ -17,6 +19,8 @@ from .utils.model_utilities import scaled_dot_product_attention
 
 # RoFormer: Enhanced Transformer with Rotary Postion Embedding https://arxiv.org/pdf/2104.09864
 # Think it as applying rotation to every pair of dimensions
+# Generating the inverse frequency, cos, sin better in fp32
+# Apply the rope rotation can be done in fp16
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, head_dim=128, rope_theta=10000.0):
         super().__init__()
@@ -55,24 +59,15 @@ class RotaryPositionEmbedding(nn.Module):
 
 # Root Mean Square Layer Normalization https://arxiv.org/pdf/1910.07467
 # Main Finding is that Layer Normalization does re-centering and rescaling of invariance, but the main contribution is the scaling of invariance
+# when computing the variance of hidden state, upcast for stability
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size=4096, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-    def my_forward(self, x : torch.Tensor):
-        rms_val = x.pow(2).mean(dim=-1,keepdim=True)
-        output = x / torch.sqrt(rms_val + self.variance_epsilon)
-        return output * self.weight
-    def forward(self, x : torch.Tensor):
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        rms_val = x.pow(2).mean(dim=-1,keepdim=True)
-        output = x / torch.sqrt(rms_val + self.variance_epsilon)
-        return output.to(input_dtype) * self.weight
-    def their_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32) # Upcast for stability
+        hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
@@ -85,6 +80,7 @@ class RMSNorm(nn.Module):
 # Swish : A Self Gated Activation Function - https://arxiv.org/pdf/1710.05941v1
 # Usually FFN : Linear -> Activation -> Linear
 # But for FNN_SwiGLU this is not the case
+# This can be in fully fp16
 class FFNSwiGLU(nn.Module):
     def __init__(self, hidden_size=4096, intermediate_size=11008):
         super().__init__()
@@ -232,6 +228,8 @@ class GroupQueryAttention(nn.Module):
         return mhsa_output, attn_weights
 
 # Combining MSA, GQA and MQA into 1 module
+# Projections, GEMM can all be in fp16
+# softmax in scaled_dot_product_attention should be in fp32
 class Attention(nn.Module):
     def __init__(self, attention_bias, head_dim, hidden_size, num_attention_heads, num_key_value_heads, rope_theta):
         super().__init__()
