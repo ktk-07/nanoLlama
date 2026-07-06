@@ -3,64 +3,38 @@ from tinygrad import Tensor
 import tinygrad.nn as nn
 import math
 
+from .embeddings import Embedding
+from .decoder import LlamaDecoder
 
-#
-class Linear:
-    def __init__(self, in_features : int, out_features : int, bias : bool = False):
-        pass
-    def __call__(self):
-        pass
-
-# Recap LLama 
-class RotaryPositionEmbeddings:
-     def __init__(self,):
-        self.inv_freq = n;
-        self.
-    def __call__(self):
-        pass
-
-class RMSNorm:
-     def __init__(self,):
-        self.weight = 
-        self.scale = 
-    def __call__(self):
-        pass
-
-
-class MLP:
-     def __init__(self,):
-        self.
-        pass
-    def __call__(self):
-        pass
-
-# MQA: Fast Transformer Decoding: One Write-Head is All You Need https://arxiv.org/pdf/1911.02150
-# MSA FOR 7B and 13B variants: Attention is All You Need https://arxiv.org/abs/1706.03762
-# GQA FOR 34B and 70B variants : Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints https://arxiv.org/pdf/2305.13245
-def scaled_dot_product_attn(Q:Tensor, K:Tensor, V:Tensor):
-
-    return attn_score ,attn_weights
-
-class Attention:
-    def __init__(self,):
-        pass
-    def __call__(self):
-        pass
-
-class LLama2Decoder:
-     def __init__(self,):
-        self.attn = Attention()
-        self. = RMSNorm()
-        self. = RMSNorm()
-        pass
-    def __call__(self):
-        pass
+@dataclass
+class LlamaConfig:
+  attention_bias:bool = false
+  attention_dropout:float =  0.0
+  dtype:str = "float16"
+  head_dim:int = 128
+  hidden_size:int = 4096
+  intermediate_size:int = 11008
+  max_position_embeddings:int = 4096
+  mlp_bias: bool = False,
+  num_attention_heads:int = 32
+  num_hidden_layers:int = 32
+  num_key_value_heads: int = 32
+  rms_norm_eps: float = 1e-05
+  rope_theta: float = 10000.0
+  use_cache: bool = True
+  vocab_size: int =  32000
 
 # LLAMA 2: Open Foundation and Fine-Tuned Chat Models https://arxiv.org/pdf/2307.09288
 class LLama2:
-     def __init__(self,):
-        pass
-    def __call__(self):
-        pass
+     def __init__(self, attention_bias, head_dim, hidden_size, num_attention_heads, num_hidden_layers, num_key_value_heads, mlp_bias, vocab_size):
+        self.embed_tokens = Embedding(vocab_size, hidden_size)
+        self.layers = [LlamaDecoder(attention_bias, head_dim, hidden_size, num_attention_heads, num_key_value_heads, mlp_bias) for _ in range(num_hidden_layers)]
+
+    def __call__(self, x, mask):
+        output = self.embed_tokens(x);
+        for idx,layer in enumerate(self.layers):
+            output, attn_weights = layer(output,mask)
+            
+        return output
 
 
