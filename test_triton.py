@@ -123,41 +123,35 @@ else:
                                    n_elements,
                                    BLOCK_SIZE
                                    ):
-        pid0 = tl.progam_id(axis=0)
-        pid1 = tl.progam_id(axis=1)
+        pid0 = tl.program_id(axis=0)
+        pid1 = tl.program_id(axis=1)
 
         row_idx = pid0 * dimensions[1] + pid1
         row_start = row_idx * dimensions[2]
 
-        # Running statistics to keep track off
-        prev_max = 0
+        # First loop to keep track of Running Statistics
         running_max = float("-inf")
         running_denominator = 0.0
 
         for i in tl.range(0, dimensions[reduction_axis], BLOCK_SIZE):
-            block_start = i + row_start
             cols = i + tl.arange(0, BLOCK_SIZE)
-            global_offsets = row_start + cols
-            # Create a mask to guard memory operations against out-of-bounds accesses.
-            mask = offsets < n_elements
-            # Load x from DRAM, masking out any extra elements in case the input is not a multiple of the block size.
+            mask = cols < dimensions[reduction_axis]
+            offsets = row_start + cols
             cur_block_vals = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
 
-            local_max = tl.max(cur_block_vals, axis=0)
-
-            # Then this should be sequential already no?
-            running_max = max(local_max,running_max)
-            running_denominator *= tl.exp(prev_max - running_max)
-            running_denominator += tl.sum(tl.exp(local_max - running_max), axis=0)
             prev_max = running_max
+            local_max = tl.max(cur_block_vals, axis=0)
+            # Update running max
+            running_max = tl.maximum(local_max,running_max)
+            running_denominator *= tl.exp(prev_max - running_max)
+            # cur_val - running max
+            running_denominator += tl.sum(tl.exp(cur_block_vals - running_max), axis=0)
 
         # We will run the loop 1 more time to compute the actual softmaxed value
         for i in tl.range(0, dimensions[reduction_axis], BLOCK_SIZE):
-            block_start = i+program_idx
-            offsets = tl.arange(block_start, block_start + BLOCK_SIZE)
-            # Create a mask to guard memory operations against out-of-bounds accesses.
-            mask = offsets < n_elements
-            # Load x from DRAM, masking out any extra elements in case the input is not a multiple of the block size.
+            cols = i + tl.arange(0, BLOCK_SIZE)
+            mask = cols < dimensions[reduction_axis]
+            offsets = row_start + cols
             cur_block_vals = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
             # Write Output to DRAM
             tl.store(output_ptr + offsets, tl.exp(cur_block_vals - running_max) / running_denominator, mask=mask)
