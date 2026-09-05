@@ -20,11 +20,12 @@ from torch.utils._triton import has_triton
 # Make use of block tiling technique
 
 # Phase 1, Just make it work on fixed dimensions first
-# 1. Implement Safe Softmax 
-# 2. Implement Online Softmax
-# 3. Implement Online Attention (Online Softmax Fused with Online Attention) so that attention does not materialise
-# 4. Implement Flash Attn Forward
-# 5. Implement Flash Attn Backward
+# 1. Implement Safe Softmax Kernel
+# 2. Implement Online Softmax Kernel
+# 3. Implement Scaled Dot Product Attention Kernel
+# 4. Implement Memory Efficient Attention Kernel (Online Softmax Fused with Scaled Dot Product Attention)
+# 5. Implement Flash Attn Forward Kernel
+# 6. Implement Flash Attn Backward Kernel
 
 # Phase 2, Just make the different functions work on arbitary dimension
 if not has_triton:
@@ -33,8 +34,9 @@ else:
     import triton
     import triton.language as tl
 
-    # Fixed Input Version
-    # B x S X H, I know in scaled dot product attention its B x N x S x H
+    # Fixed Input Version First
+    # Original B x S X H
+    # Now B x N x S x H
 
     # Softmax is a unary operation
     @triton.jit
@@ -48,8 +50,8 @@ else:
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
 
-        row_idx = pid0 * dimensions[1] + pid1
-        row_start = row_idx * dimensions[2]
+        row_idx = pid0 * dimensions[2] + pid1
+        row_start = row_idx * dimensions[3]
 
         # 3 Loops
         # 1 Loop for the global_max in that dimension
@@ -80,7 +82,7 @@ else:
             offsets = row_start + cols
             # Load x from DRAM, masking out any extra elements in case the input is not a multiple of the block size.
             cur_block_vals = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-            local_sum = tl_sum(tl.exp(cur_block_vals - global_max), axis=0)
+            local_sum = tl.sum(tl.exp(cur_block_vals - global_max), axis=0)
             denominator += local_sum
 
         # We will run the loop 1 more time to compute the actual softmaxed value
@@ -98,23 +100,24 @@ else:
         # 1. We need to preallocate the outputs
         #   - need to extract out the dim that we are reducing over
         #   - lets just assume we always reduce over the last dimension first
-        output = torch.empty_like(x.shape[x:-1) # Let just assume we alway reduce over the last dimension first
+        output = torch.empty_like(x.shape) # Let just assume we alway reduce over the last dimension first
 
         assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
         n_elements = output.numel()
         # 2. Similar to how in cuda/c we define dim3 threadDim, blockDim, gridDim
         # We basically need to define the launch grid, it is at most 3D
         # Mapping the program instance to tensor
-        B,S,H = x.shape
+        B,N,S,H = x.shape
         #grid = lambda x : ()
-        grid = (B,S,) 
+        grid = (B*N,S,) 
         dimensions = x.shape
-        reduction_axis = 2
+        reduction_axis = 3
 
         # 3. Each program instance will run 1 block of N elements
         safe_softmax_triton_kernel[grid](x,output,dimensions,reduction_axis,n_elements,BLOCK_SIZE=H)
         return output
 
+    # Online normalizer calculation for softmax: https://arxiv.org/pdf/1805.02867
     @triton.jit
     def online_softmax_triton_kernel(x_ptr,
                                    output_ptr,
@@ -126,8 +129,8 @@ else:
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
 
-        row_idx = pid0 * dimensions[1] + pid1
-        row_start = row_idx * dimensions[2]
+        row_idx = pid0 * dimensions[2] + pid1
+        row_start = row_idx * dimensions[3]
 
         # First loop to keep track of Running Statistics
         running_max = float("-inf")
@@ -158,25 +161,54 @@ else:
 
     def online_softmax_triton(x, dim=-1):
 
-        output = torch.empty_like(x.shape[x:-1) # Let just assume we alway reduce over the last dimension first
+        output = torch.empty_like(x.shape)
 
-        assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
         n_elements = output.numel()
-        B,S,H = x.shape
+        B,N,S,H = x.shape
         #grid = lambda x : ()
-        grid = (B,S,) 
+        grid = (B, N*S,) 
         dimensions = x.shape
-        reduction_axis = 2
+        reduction_axis = 3
 
         online_softmax_triton_kernel[grid](x,output,dimensions,reduction_axis,n_elements,BLOCK_SIZE=H)
         return output
+
+
+    # Attention is all you need : https://arxiv.org/pdf/1706.03762
+    @triton.jit
+    def scaled_dot_product_attn_kernel():
+
+        # Matrix Multiplication S = Q @ K^T
+        # Need to Index K in a Column-Major Manner
+
+        pass
+
+    def scaled_dot_product_attn(Q,K,V,mask):
+        # Defining the output
+
+        grid = ()
+        return scaled_dot_product_attn[grid](Q,K,V)
+
+
+    # SELF-ATTENTION DOES NOT NEED O(n^2) MEMORY: https://arxiv.org/pdf/2112.05682
+    @triton.jit
+    def memory_efficient_attn_kernel():
+        # 1. We dont want to materialise the S and the P 
+        # 2. 
+
+        pass
+
+    def memory_efficient_attn(Q,K,V,mask):
+        grid = ()
+        return memory_efficient_attn_kernel[grid](Q,K,V)
 
     # Compare Speed of softmax in pytorch and triton
     def scaled_dot_product_attn_flash():
         pass
 
+    # Compare Speed of softmax in pytorch and triton
+    def scaled_dot_product_attn_flash():
+        pass
 
-    inputs = torch. 
-
-
-
+    def scaled_dot_product_attn_flash():
+        pass
