@@ -165,7 +165,6 @@ else:
 
         n_elements = output.numel()
         B,N,S,H = x.shape
-        #grid = lambda x : ()
         grid = (B, N*S,) 
         dimensions = x.shape
         reduction_axis = 3
@@ -176,18 +175,53 @@ else:
 
     # Attention is all you need : https://arxiv.org/pdf/1706.03762
     @triton.jit
-    def scaled_dot_product_attn_kernel():
+    def scaled_dot_product_attn_kernel(
+                                      q_ptr,
+                                      k_ptr,
+                                      v_ptr,
+                                      s_ptr,
+                                      p_ptr,
+                                      v_ptr,
+                                      input_dimensions,
+                                      output_dimensions
+                                      ):
 
         # Matrix Multiplication S = Q @ K^T
         # Need to Index K in a Column-Major Manner
+        # Optimisation we can make to Matmul
+        pid0 = tl.program_id(axis=0)
+        pid1 = tl.program_id(axis=1)
+
+        row_idx = pid0 * input_dimensions[2] + pid1
+        row_start = row_id * input_dimensions[3]
+
+        col_idx = 
+        col_start =
+
+        for i in tl.arange(input_dimensions[0])
+
+
+        # Rescaled S / sqrt(H)
+
+        # Apply Mask 
+
+        # Softmax to get P
+
+        # O = P @ V
+
+
 
         pass
 
     def scaled_dot_product_attn(Q,K,V,mask):
-        # Defining the output
+        # Defining the outputs as well as intermediate tensors required
+        B, N, S, H = Q.shape
+        S = torch.empty_like((B,N,S,S))
+        P = torch.empty_like(Q.shape) 
+        O = torch.empty_like(Q.shape)
+        grid = (B*N, S) # Grid should be actual work/output tiles your kernel is responsible 
 
-        grid = ()
-        return scaled_dot_product_attn[grid](Q,K,V)
+        return scaled_dot_product_attn[grid](Q,K,V,S,P,O, Q.shape, O.shape)
 
 
     # SELF-ATTENTION DOES NOT NEED O(n^2) MEMORY: https://arxiv.org/pdf/2112.05682
