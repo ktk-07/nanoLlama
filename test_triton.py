@@ -183,25 +183,51 @@ else:
                                       p_ptr,
                                       v_ptr,
                                       input_dimensions,
-                                      output_dimensions
+                                      output_dimensions,
+                                      BLOCK_SIZE=1024
                                       ):
 
         # Matrix Multiplication S = Q @ K^T
+        # How do we want to speed up the matrix multiplication?
+        # Load a block of row of Q and loadd a block of row of K 
+        # Then load throught the 
+
         # Need to Index K in a Column-Major Manner
         # Optimisation we can make to Matmul
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
+        pid2 = tl.program_id(axis=2)
 
-        row_idx = pid0 * input_dimensions[2] + pid1
-        row_start = row_id * input_dimensions[3]
+        # B x N x S x H
+        # B*N x S x H
+        # Grid (B*H, S, )
 
-        col_idx = 
-        col_start =
+        row_idx_q = pid0 * input_dimensions[2] + pid1
+        row_start_q = row_idx_q * input_dimensions[3]
 
-        for i in tl.arange(input_dimensions[0])
+        row_idx_k = pid0 * input_dimensions[2] + pid2
+        row_start_k = row_idx_q * input_dimensions[3]
 
+        # So 1 program has 1 row of Q and 1 row of K (K tranpose shape is B x N x H x S, then we want the column of the tranpose which is jus thw row of K)
+        # basically think of it like row vector and row vector dot product
+        # Thus i think we dont need these 2 lines here where by we do column-major indexing, but if we were to do column based indexing would this be correct?
+        #col_idx = pid0 * input_dimensions[2]
+        #col_start =
 
+        accumulator = 0.0     
+        for i in tl.range(0, input_dimensions[3], BLOCK_SIZE):
+            # We need to accumulate then store
+            idxes_along_k = i + tl.arange(0, BLOCK_SIZE)
+            masks = idxes_along_k < input_dimensions[3]
+            offsets = row_start_q + idxes_along_k
+            offsets_k = row_start_k + idxes_along_k
+            q = tl.load(q_ptr+offsets,mask=mask, other=0.0)
+            k = tl.load(k_ptr+offsets_k,mask=mask, other=0.0)
+            accumulator += tl.sum(q*k,axis=0)
+
+        # Feels like im not indexing correctly too
         # Rescaled S / sqrt(H)
+        tl.store(s_ptr + row_idx, accumulator / tl.sqrt(input_dimensions[3], total_sum) 
 
         # Apply Mask 
 
@@ -217,11 +243,11 @@ else:
         # Defining the outputs as well as intermediate tensors required
         B, N, S, H = Q.shape
         S = torch.empty_like((B,N,S,S))
-        P = torch.empty_like(Q.shape) 
+        P = torch.empty_like((B,N,S,S))
         O = torch.empty_like(Q.shape)
-        grid = (B*N, S) # Grid should be actual work/output tiles your kernel is responsible 
+        grid = (B*N, S, H) # Grid should be actual work/output tiles your kernel is responsible 
 
-        return scaled_dot_product_attn[grid](Q,K,V,S,P,O, Q.shape, O.shape)
+        return scaled_dot_product_attn[grid](Q,K,V,S,P,O, Q.shape, O.shape, BLOCK_SIZE=1024)
 
 
     # SELF-ATTENTION DOES NOT NEED O(n^2) MEMORY: https://arxiv.org/pdf/2112.05682
