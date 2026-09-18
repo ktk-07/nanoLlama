@@ -26,7 +26,8 @@ else:
                no_of_elements,
                BLOCK_Q,
                BLOCK_K,
-               BLOCK_SIZE=1024
+               BLOCK_SIZE=1024,
+               scaled=True
                ):
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
@@ -64,10 +65,16 @@ else:
 
         O_BlOCK_IDX = o_offset + rows[:, None] * output_dim[-1] + cols[None, :] 
         mask = rows_mask[:, None] & cols_mask[None, :]
-        tl.store(output_ptr + O_BLOCK_IDX, acc, mask=mask)
+
+        # In S = Q @ K^T / sqrt(d_k)
+        if scaled:
+            tl.store(output_ptr + O_BLOCK_IDX, acc / tl.sqrt(outdim[-1]), mask=mask)
+        else:
+            tl.store(output_ptr + O_BLOCK_IDX, acc, mask=mask)
 
     def matmul(Q,
-               K
+               K,
+               scaled=True;
                ):
         B_Q, N_Q, S_Q, H_Q = Q.shape
         B_K, N_K, H_K, S_K = K.shape
@@ -84,18 +91,18 @@ else:
 
         no_of_elements = O.numel()
 
-        matmul_kernel[grid](Q, K, output, no_of_elements, BLOCK_Q, BLOCK_K, BLOCK_INNER_DIM)
+        matmul_kernel[grid](Q, K, output, no_of_elements, BLOCK_Q, BLOCK_K, BLOCK_INNER_DIM, scaled)
 
         return output
 
     @triton.jit
-    def softmax_kernel(s_ptr,
-                       output_ptr,
-                       s_dimensions,
-                       ):
+    def scaled_softmax_kernel(s_ptr,
+                              output_ptr,
+                              s_dimensions,
+                              ):
         pass
 
-    def softmax(s
+    def scaled_softmax(s
                 ):
         output = None
         return output
