@@ -96,13 +96,72 @@ else:
         return output
 
     @triton.jit
-    def scaled_softmax_kernel(s_ptr,
-                              output_ptr,
-                              s_dimensions,
-                              ):
-        pass
+    def safe_softmax_kernel(s_ptr,
+                       output_ptr,
+                       s_dimensions,
+                       output_dimensions,
+                       BLOCK_SIZE=1024
+                       ):
+        pid0 = tl.program_id(axis=0)
+        pid1 = tl.program_id(axis=1)
+        
+        # Get the base offset idx
+        row_start = pid0 * output_dimensions[2] * output_dimensions[3]
 
-    def scaled_softmax(s
+        # Three Loops
+        # Loop 1 to get max
+        max_val = float("-inf")
+        for i in tl.range(0, output_dimensions[-1], BLOCK_SIZE):
+            cols = i + tl.arange(0,BLOCK_SIZE)
+            mask = cols < output_dimensions[-1]
+            offsets = pid1 * output_dimensions[-1] + cols
+            col_idxes = row_start + offsets 
+
+            vals = tl.load(s_ptr + col_idxes, mask=mask, other=float("-inf"))
+            local_max = tl.max(vals, axis=0)
+            max_val = tl.maximum(local_max,max_val)
+
+        # Loop 2 to compute denominator
+        denominator = 0.0
+        for i in tl.range(0, output_dimensions[-1], BLOCK_SIZE):
+            cols = i + tl.arange(0,BLOCK_SIZE)
+            mask = cols < output_dimensions[-1]
+            offsets = pid1 * output_dimensions[-1] + cols
+            col_idxes = row_start + offsets 
+
+            vals = tl.load(s_ptr + col_idxes, mask=mask, other=float("-inf"))
+            denominator += tl.sum(tl.exp(vals-max_val),axis=0)
+
+        # Loop 3 to compute the actual softmax value and write to output_ptr
+        for i in tl.range(0, output_dimensions[-1], BLOCK_SIZE):
+            cols = i + tl.arange(0,BLOCK_SIZE)
+            mask = cols < output_dimensions[-1]
+            offsets = pid1 * output_dimensions[-1] + cols
+            col_idxes = row_start + offsets 
+
+            vals = tl.load(s_ptr + col_idxes, mask=mask, other=float("-inf"))
+            actual = tl.exp(vals - max_val) / denominator
+            tl.store(output_ptr + col_idxes, actual, mask=mask)
+
+
+    # This is the naive version of safe_softmax with no onlinesoftmax calculator
+    def safe_softmax(S
                 ):
-        output = None
+        # In S = Q @ K^T / sqrt(d_k)
+        # P = softmax(S)
+
+        # S's shape = B x N x S x H
+        # O's shape = B x N x S x H
+        B, N, S, H = S.shape
+        output = torch.empty_like(s_dimensions, device=S.dtpe, dtype=S.dtype)
+        o_dimensions = o.shape
+        grid = (B*N, S,) # each program is responsible for 1 row of output
+        BLOCK_SIZE = 1024
+        
+        safe_softmax_kernel[grid](s, output, s_dimensions, output_dimensions, BLOCK_SIZE=BLOCK_SIZE)
+
         return output
+
+
+    def scaled_dot_product_attention():
+        pass
