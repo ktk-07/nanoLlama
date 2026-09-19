@@ -23,11 +23,10 @@ else:
                q_dim,
                k_dim,
                output_dim,
-               no_of_elements,
-               BLOCK_Q,
-               BLOCK_K,
-               BLOCK_SIZE=1024,
-               scaled=True
+               BLOCK_Q:tl.constexpr,
+               BLOCK_K:tl.constexpr,
+               BLOCK_SIZE:tl.constexpr=1024,
+               scaled:tl.constexpr=True
                ):
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
@@ -89,9 +88,7 @@ else:
         # Launch Grid Replaces Loops that represent independent work; explicit loops remain primarily where there is a dependency/reduction.
         grid = (B_K*N_K, math.ceil(S_Q / BLOCK_Q), math.ceil(S_K, BLOCK_K))
 
-        no_of_elements = O.numel()
-
-        matmul_kernel[grid](Q, K, output, no_of_elements, BLOCK_Q, BLOCK_K, BLOCK_INNER_DIM, scaled)
+        matmul_kernel[grid](Q, K, output, BLOCK_Q, BLOCK_K, BLOCK_INNER_DIM, scaled)
 
         return output
 
@@ -100,7 +97,7 @@ else:
                        output_ptr,
                        s_dimensions,
                        output_dimensions,
-                       BLOCK_SIZE=1024
+                       BLOCK_SIZE:tl.constexpr=1024
                        ):
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
@@ -146,7 +143,7 @@ else:
 
     # This is the naive version of safe_softmax with no onlinesoftmax calculator
     def safe_softmax(S
-                ):
+                     ):
         # In S = Q @ K^T / sqrt(d_k)
         # P = softmax(S)
 
@@ -161,7 +158,3 @@ else:
         safe_softmax_kernel[grid](s, output, s_dimensions, output_dimensions, BLOCK_SIZE=BLOCK_SIZE)
 
         return output
-
-
-    def scaled_dot_product_attention():
-        pass
