@@ -20,9 +20,14 @@ else:
     def matmul(q_ptr,
                k_ptr,
                output_ptr,
-               q_dim,
-               k_dim,
-               output_dim,
+               B,
+               N,
+               row, # S
+               col, # S
+               inner_dim, # H
+               stride_qb,stride_qn,stride_qs,stride_qh,
+               stride_kb,stride_kn,stride_kh,stride_ks,
+               stride_ob,stride_on,stride_oqs,stride_oks,
                BLOCK_Q:tl.constexpr,
                BLOCK_K:tl.constexpr,
                BLOCK_SIZE:tl.constexpr=1024,
@@ -32,42 +37,48 @@ else:
         pid1 = tl.program_id(axis=1)
         pid2 = tl.program_id(axis=2)
 
-        INNER_DIM = q_dim[-1]
-
         # Always compute the base memory offset for the selected batch/head
-        q_offset = pid0 * q_dim[2] * q_dim[3]
-        k_offset = pid0 * k_dim[2] * k_dim[3]
-        o_offset = pid0 * output_dim[2] * output_dim[3]
+        # 1. Continguous  memory indexing, only works each input and output stored in a row-major format
+        # q_offset = pid0 * q_dim[2] * q_dim[3]
+        # k_offset = pid0 * k_dim[2] * k_dim[3]
+        # o_offset = pid0 * output_dim[2] * output_dim[3]
+        # 2. Stride-based Indexing
+        # Because we flatten the grid into (B*N,no_of_block_q,no_of_of_block_k)
+        b_idx = pid0 // N
+        n_idx = pid0 % N
+        q_offset = b_idx * stride_qb + n_idx * stride_qn
+        k_offset = b_idx * stride_kb + n_idx * stride_kn
+        o_offset = b_idx * stride_ob + n_idx * stride_on
 
         # Get the rows and cols that we want to compute first
         rows = pid1 * BLOCK_Q + tl.arange(0, BLOCK_Q)
         cols = pid2 * BLOCK_K + tl.arange(0, BLOCK_K)
 
-        rows_mask = rows < q_dim[-2]
-        cols_mask = cols < k_dim[-1]
+        rows_mask = rows < row
+        cols_mask = cols < col
 
         acc = tl.zeros((BLOCK_Q,BLOCK_K), dtype=tl.float32)
 
         # Loop through the K
-        for i in tl.range(0, INNER_DIM, BLOCK_SIZE):
-            inner_offsets = i + tl.arange(BLOCK_SIZE)
-            inner_mask = inner_offsets < INNER_DIM
+        for i in tl.range(0, inner_dim, BLOCK_SIZE):
+            inner_offsets = i + tl.arange(0, BLOCK_SIZE)
+            inner_mask = inner_offsets < inner_dim
             Q_mask = rows_mask[:, None] & inner_mask[None, :]
             K_mask = cols_mask[None, :] & inner_mask[:, None]
 
-            Q_IDX_BLOCK = q_offset + rows[:, None] * q_dim[-1] + inner_offsets[None, :] # im assuming rows[:None] means the we unsqueeze to get q x 1, inner_offsets[None:] means we get 1 x inner
+            Q_IDX_BLOCK = q_offset + rows[:, None] * stride_qs + inner_offsets[None, :] * stride_qh # Assuming rows[:None] means the we unsqueeze to get q x 1, inner_offsets[None:] means we get 1 x inner
             Q_BLOCK = tl.load(q_ptr + Q_IDX_BLOCK, mask=Q_mask, other=0.0)
-            K_IDX_BLOCK = k_offset + cols[None, :] + k_dim[-1] * inner_offsets[:, None] # Im assuming cols[None:] means the we unsqueeze to get 1 x k, inner_offsets[None:] means we get inner x 1
+            K_IDX_BLOCK = k_offset + inner_offsets[:, None] * stride_kh + cols[None, :] * stride_ks # Assuming cols[None:] means the we unsqueeze to get 1 x k, inner_offsets[None:] means we get inner x 1
             K_BLOCK = tl.load(k_ptr + K_IDX_BLOCK, mask=K_mask, other=0.0)
 
             acc += tl.dot(Q_BLOCK,K_BLOCK)
 
-        O_BlOCK_IDX = o_offset + rows[:, None] * output_dim[-1] + cols[None, :] 
+        O_BlOCK_IDX = o_offset + rows[:, None] * stride_oqs + cols[None, :] * stride_oks
         mask = rows_mask[:, None] & cols_mask[None, :]
 
         # In S = Q @ K^T / sqrt(d_k)
         if scaled:
-            tl.store(output_ptr + O_BLOCK_IDX, acc / tl.sqrt(outdim[-1]), mask=mask)
+            tl.store(output_ptr + O_BLOCK_IDX, acc / tl.sqrt(inner_dim), mask=mask)
         else:
             tl.store(output_ptr + O_BLOCK_IDX, acc, mask=mask)
 
@@ -75,10 +86,13 @@ else:
                K,
                scaled=True;
                ):
+        stride_qb,stride_qn,stride_qs,stride_qh = Q.stride()
+        stride_kb,stride_kn,stride_kh,stride_ks = K.stride()
         B_Q, N_Q, S_Q, H_Q = Q.shape
         B_K, N_K, H_K, S_K = K.shape
         assert H_Q == H_K , "Inner dimensions of Tensors not Matching"
-        output = torch.empty_like(B_K, N_K, S_Q, S_K, device=Q.device, dtype=Q.dtype)
+        output = torch.empty((B_K, N_K, S_Q, S_K), device=Q.device, dtype=Q.dtype)
+        stride_ob,stride_on,stride_oqs,stride_oks = output.stride()
 
         # Block Sizes does not have to be the same
         BLOCK_Q = 32
@@ -87,8 +101,25 @@ else:
         
         # Launch Grid Replaces Loops that represent independent work; explicit loops remain primarily where there is a dependency/reduction.
         grid = (B_K*N_K, math.ceil(S_Q / BLOCK_Q), math.ceil(S_K, BLOCK_K))
-
-        matmul_kernel[grid](Q, K, output, BLOCK_Q, BLOCK_K, BLOCK_INNER_DIM, scaled)
+        row = S_Q
+        col = S_K
+        inner_dim = H_Q
+        matmul_kernel[grid](Q, 
+                            K, 
+                            output, 
+                            B_Q, 
+                            N_Q, 
+                            row, 
+                            col, 
+                            inner_dim, 
+                            stride_qb,stride_qn,stride_qs,stride_qh, 
+                            stride_kb,stride_kn,stride_kh,stride_ks,
+                            stride_ob,stride_on,stride_oqs,stride_oks,
+                            BLOCK_Q,
+                            BLOCK_K, 
+                            BLOCK_INNER_DIM, 
+                            scaled
+                            )
 
         return output
 
@@ -141,7 +172,7 @@ else:
             tl.store(output_ptr + col_idxes, actual, mask=mask)
 
 
-    # This is the naive version of safe_softmax with no onlinesoftmax calculator
+    # This is the naive version of safe_softmax with no online softmax calculator
     def safe_softmax(S
                      ):
         # In S = Q @ K^T / sqrt(d_k)
