@@ -17,7 +17,7 @@ else:
     # Implementing Matmul
     # When writing kernels in triton, the shape-matching idea is a very useful Triton habit
     @triton.jit
-    def matmul(q_ptr,
+    def matmul_kernel(q_ptr,
                k_ptr,
                output_ptr,
                B,
@@ -31,7 +31,7 @@ else:
                BLOCK_Q:tl.constexpr,
                BLOCK_K:tl.constexpr,
                BLOCK_SIZE:tl.constexpr=1024,
-               scaled:tl.constexpr=True
+               scaled:tl.constexpr=False
                ):
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
@@ -71,9 +71,9 @@ else:
             K_IDX_BLOCK = k_offset + inner_offsets[:, None] * stride_kh + cols[None, :] * stride_ks # Assuming cols[None:] means the we unsqueeze to get 1 x k, inner_offsets[None:] means we get inner x 1
             K_BLOCK = tl.load(k_ptr + K_IDX_BLOCK, mask=K_mask, other=0.0)
 
-            acc += tl.dot(Q_BLOCK,K_BLOCK)
+            acc += tl.dot(Q_BLOCK,K_BLOCK, input_precision="ieee")
 
-        O_BlOCK_IDX = o_offset + rows[:, None] * stride_oqs + cols[None, :] * stride_oks
+        O_BLOCK_IDX = o_offset + rows[:, None] * stride_oqs + cols[None, :] * stride_oks
         mask = rows_mask[:, None] & cols_mask[None, :]
 
         # In S = Q @ K^T / sqrt(d_k)
@@ -84,7 +84,7 @@ else:
 
     def matmul(Q,
                K,
-               scaled=True,
+               scaled=False,
                ):
         stride_qb,stride_qn,stride_qs,stride_qh = Q.stride()
         stride_kb,stride_kn,stride_kh,stride_ks = K.stride()
@@ -97,10 +97,10 @@ else:
         # Block Sizes does not have to be the same
         BLOCK_Q = 32
         BLOCK_K = 32
-        BLOCK_INNER_DIM = 1024
+        BLOCK_INNER_DIM = 128
         
         # Launch Grid Replaces Loops that represent independent work; explicit loops remain primarily where there is a dependency/reduction.
-        grid = (B_K*N_K, math.ceil(S_Q / BLOCK_Q), math.ceil(S_K, BLOCK_K))
+        grid = (B_K*N_K, triton.cdiv(S_Q, BLOCK_Q), triton.cdiv(S_K, BLOCK_K))
         row = S_Q
         col = S_K
         inner_dim = H_Q
@@ -191,18 +191,18 @@ else:
 
         # S's shape = B x N x S x H
         # O's shape = B x N x S x H
-        B, N, S, H = S.shape
+        B, N, s, H = S.shape
         output = torch.empty(S.shape, device=S.device, dtype=S.dtype)
         stride_sb,stride_sn,stride_ss,stride_sh = S.stride()
         stride_ob,stride_on,stride_os,stride_oh = output.stride()
-        grid = (B*N, S,) # each program is responsible for 1 row of output
-        BLOCK_SIZE = 1024
+        grid = (B*N, s,) # each program is responsible for 1 row of output
+        BLOCK_SIZE = 128
 
         safe_softmax_kernel[grid](S,
                                   output, 
                                   B,
                                   N,
-                                  S,
+                                  s,
                                   H,
                                   stride_sb,stride_sn,stride_ss,stride_sh, 
                                   stride_ob,stride_on,stride_os,stride_oh,
@@ -210,3 +210,36 @@ else:
                                   )
 
         return output
+
+    b = 2
+    n = 2
+    s = 14
+    h = 18
+    # Testing Softmax
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device == "cuda": 
+        Q = torch.randn(b,n,s,h, device=device, dtype=torch.float32)
+        K = torch.randn(b,n,s,h, device=device, dtype=torch.float32)    
+        K_tranposed = K.permute(0,1,3,2)
+        V = torch.randn(b,n,s,h)    
+        O = torch.randn(b,n,s,h)    
+        # Testing Matmul
+        output1 = matmul(Q,K_tranposed)               
+        output2 = Q @ K_tranposed
+        print(torch.allclose(output1, output2, atol=1e-5))
+        # Testing Softmax
+        output3 = safe_softmax(output1)
+        output4 = torch.softmax(output2,dim=-1)
+        print(torch.allclose(output3, output4, atol=1e-5))
+        print("matmul allclose:",
+              torch.allclose(output1, output2, atol=1e-5, rtol=1e-5))
+
+        print("max abs error:",
+              (output1 - output2).abs().max().item())
+
+        print("mean abs error:",
+              (output1 - output2).abs().mean().item()) 
+
+    else:
+        print("Cant test") 
