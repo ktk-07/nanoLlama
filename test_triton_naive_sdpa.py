@@ -70,7 +70,8 @@ else:
             Q_BLOCK = tl.load(q_ptr + Q_IDX_BLOCK, mask=Q_mask, other=0.0)
             K_IDX_BLOCK = k_offset + inner_offsets[:, None] * stride_kh + cols[None, :] * stride_ks # Assuming cols[None:] means the we unsqueeze to get 1 x k, inner_offsets[None:] means we get inner x 1
             K_BLOCK = tl.load(k_ptr + K_IDX_BLOCK, mask=K_mask, other=0.0)
-
+            # On an NVIDIA GPU, Triton was free to use TF32-style tensor-core multiplication for FP32 inputs.
+            # If we dont set input_precision="ieee", there would be an error
             acc += tl.dot(Q_BLOCK,K_BLOCK, input_precision="ieee")
 
         O_BLOCK_IDX = o_offset + rows[:, None] * stride_oqs + cols[None, :] * stride_oks
@@ -125,7 +126,7 @@ else:
 
     # B x N x S x H
     @triton.jit
-    def safe_softmax_kernel(s_ptr,
+    def safe_softmax_kernel_last_dim(s_ptr,
                             output_ptr,
                             B,
                             N,
@@ -184,8 +185,8 @@ else:
 
 
     # This is the naive version of safe_softmax with no online softmax calculator
-    def safe_softmax(S
-                     ):
+    def safe_softmax_last_dim(S
+                              ):
         # In S = Q @ K^T / sqrt(d_k)
         # P = softmax(S)
 
@@ -198,7 +199,7 @@ else:
         grid = (B*N, s,) # each program is responsible for 1 row of output
         BLOCK_SIZE = 128
 
-        safe_softmax_kernel[grid](S,
+        safe_softmax_kernel_last_dim[grid](S,
                                   output, 
                                   B,
                                   N,
@@ -210,6 +211,128 @@ else:
                                   )
 
         return output
+
+    # This is the generalised version of the softmax
+    # Note it is fixed-rank but generalised softmax
+    # We flatten all other dimensions that is not that dimension along which we want to compute the softmax for
+    # Softmax over dimension d
+    # One triton program own 1 slice where every coordinate except d is fixed
+    @triton.jit
+    def safe_softmax_kernel(s_ptr,
+                            o_ptr,
+                            D0,
+                            D1,
+                            D2,
+                            D3,
+                            dim,
+                            stride_sb,stride_sn,stride_ss,stride_sh, 
+                            stride_ob,stride_on,stride_os,stride_oh,
+                            BLOCK_SIZE:tl.constexpr=1024
+                            ): 
+
+        pid = tl.program_id(axis=0)
+        base_offset = 0
+        # We are going to loop over it
+        reduction_size = 0
+        reduction_stride = 0
+
+        if dim == 0:
+            reduction_size = D0
+            reduction_stride = stride_sb
+            # You wan to compute the stride here
+            idx1 = pid // (D2*D3)
+            rem = pid % (D2*D3)
+            idx2 = rem // D2
+            idx3 = rem % D2
+
+            base_offset = idx1 * stride_sn + idx2 * stride_ss + idx3 * stride_sh
+
+        elif dim == 1:
+            reduction_size = D1
+            reduction_stride = stride_sn
+            # You wan to compute the stride here
+            idx0 = pid // (D2*D3)
+            rem = pid % (D2*D3)
+            idx2 = rem // D2
+            idx3 = rem % D2
+
+            base_offset = idx0 * stride_sb + idx2 * stride_ss + idx3 * stride_sh
+
+        elif dim == 2:
+            reduction_size = D2
+            reduction_stride = stride_ss
+            # You wan to compute the stride here
+            idx0 = pid // (D1*D3)
+            rem = pid % (D1*D3)
+            idx2 = rem // D1
+            idx3 = rem % D1
+
+            base_offset = idx0 * stride_sb + idx1 * stride_sn + idx3 * stride_sh
+
+        else:
+            reduction_size = D3
+            reduction_stride = stride_sh
+            # You wan to compute the stride here
+            idx0 = pid // (D1*D2)
+            rem = pid % (D1*D2)
+            idx1 = rem // D1
+            idx2 = rem % D1
+
+            base_offset = idx0 * stride_sb + idx1 * stride_sn + idx2 * stride_ss
+
+        max_val = float("-inf")
+        for i in tl.range(0,reduction_size, BLOCK_SIZE):
+            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            mask = reduction_tensor < reduction_size
+            offsets = base_offset + reduction_tensor * reduction_stride
+
+            values = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
+            local_max = tl.max(values,axis=0)
+            max_val = tl.maximum(max_val,local_max)
+
+        denominator = 0.0
+        for i in tl.range(0,reduction_size, BLOCK_SIZE):
+            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            mask = reduction_tensor < reduction_size
+            offsets = base_offset + reduction_tensor * reduction_stride
+
+            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
+            denominator += tl.sum(tl.exp(vals-max_val),axis=0)
+
+        denominator = 0.0
+        for i in tl.range(0,reduction_size, BLOCK_SIZE):
+            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            mask = reduction_tensor < reduction_size
+            offsets = base_offset + reduction_tensor * reduction_stride
+
+            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
+            tl.store(o_ptr + offsets, tl.exp(vals-max_val)/denominator)
+
+
+    def safe_softmax(S,
+                     dim=None
+                     ):
+        output = torch.empty(S, dtype=S.dtype, device=S.dtype)
+        stride_sb,stride_sn,stride_ss,stride_sh = S.stride()
+        stride_ob,stride_on,stride_os,stride_oh = O.stride()
+        D0, D1, D2, D3 = S.shape
+        grid_size = 0
+        for idx,dim in enumerate(S.shape)
+            if idx != dim:
+                grid_size += dim
+        grid = (grid_size,)
+        
+        safe_softmax_kernel(s_ptr,
+                            o_ptr,
+                            D0,
+                            D1,
+                            D2,
+                            D3,
+                            dim,
+                            stride_sb,stride_sn,stride_ss,stride_sh, 
+                            stride_ob,stride_on,stride_os,stride_oh,
+                            BLOCK_SIZE=128
+                            )
 
     b = 2
     n = 2
@@ -229,7 +352,7 @@ else:
         output2 = Q @ K_tranposed
         print(torch.allclose(output1, output2, atol=1e-5))
         # Testing Softmax
-        output3 = safe_softmax(output1)
+        output3 = safe_softmax_last_dim(output1)
         output4 = torch.softmax(output2,dim=-1)
         print(torch.allclose(output3, output4, atol=1e-5))
         print("matmul allclose:",
