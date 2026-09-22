@@ -127,15 +127,15 @@ else:
     # B x N x S x H
     @triton.jit
     def safe_softmax_kernel_last_dim(s_ptr,
-                            output_ptr,
-                            B,
-                            N,
-                            S,
-                            H,
-                            stride_sb,stride_sn,stride_ss,stride_sh, 
-                            stride_ob,stride_on,stride_os,stride_oh,
-                            BLOCK_SIZE:tl.constexpr=1024
-                            ):
+                                     output_ptr,
+                                     B,
+                                     N,
+                                     S,
+                                     H,
+                                     stride_sb,stride_sn,stride_ss,stride_sh, 
+                                     stride_ob,stride_on,stride_os,stride_oh,
+                                     BLOCK_SIZE:tl.constexpr=1024
+                                     ):
         pid0 = tl.program_id(axis=0)
         pid1 = tl.program_id(axis=1)
         
@@ -232,107 +232,130 @@ else:
 
         pid = tl.program_id(axis=0)
         base_offset = 0
+        o_base_offset = 0
         # We are going to loop over it
         reduction_size = 0
         reduction_stride = 0
+        o_reduction_stride = 0
 
+        # Since the Dimensions of O and S are the same, we can use the same idxes just use different strides
         if dim == 0:
             reduction_size = D0
             reduction_stride = stride_sb
-            # You wan to compute the stride here
+            o_reduction_stride = stride_ob
+            # You wan to compute the stride for s here 
             idx1 = pid // (D2*D3)
             rem = pid % (D2*D3)
-            idx2 = rem // D2
-            idx3 = rem % D2
+            idx2 = rem // D3
+            idx3 = rem % D3
 
             base_offset = idx1 * stride_sn + idx2 * stride_ss + idx3 * stride_sh
+            o_base_offset = idx1 * stride_on + idx2 * stride_os + idx3 * stride_oh
+
 
         elif dim == 1:
             reduction_size = D1
             reduction_stride = stride_sn
-            # You wan to compute the stride here
+            o_reduction_stride = stride_on
+            # You wan to compute the stride for s here
             idx0 = pid // (D2*D3)
             rem = pid % (D2*D3)
-            idx2 = rem // D2
-            idx3 = rem % D2
+            idx2 = rem // D3
+            idx3 = rem % D3
 
             base_offset = idx0 * stride_sb + idx2 * stride_ss + idx3 * stride_sh
+            o_base_offset = idx0 * stride_ob + idx2 * stride_os + idx3 * stride_oh
 
         elif dim == 2:
             reduction_size = D2
             reduction_stride = stride_ss
-            # You wan to compute the stride here
+            o_reduction_stride = stride_os
+            # You wan to compute the stride for s here
             idx0 = pid // (D1*D3)
             rem = pid % (D1*D3)
-            idx2 = rem // D1
-            idx3 = rem % D1
+            idx1 = rem // D3
+            idx3 = rem % D3
 
             base_offset = idx0 * stride_sb + idx1 * stride_sn + idx3 * stride_sh
+            o_base_offset = idx0 * stride_ob + idx1 * stride_on + idx3 * stride_oh
 
         else:
             reduction_size = D3
             reduction_stride = stride_sh
-            # You wan to compute the stride here
+            o_reduction_stride = stride_oh
+            # You wan to compute the stride for s here
             idx0 = pid // (D1*D2)
             rem = pid % (D1*D2)
-            idx1 = rem // D1
-            idx2 = rem % D1
+            idx1 = rem // D2
+            idx2 = rem % D2
 
             base_offset = idx0 * stride_sb + idx1 * stride_sn + idx2 * stride_ss
+            o_base_offset = idx0 * stride_ob + idx1 * stride_on + idx2 * stride_os
 
         max_val = float("-inf")
         for i in tl.range(0,reduction_size, BLOCK_SIZE):
-            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            reduction_tensor = i + tl.arange(0,BLOCK_SIZE)
             mask = reduction_tensor < reduction_size
             offsets = base_offset + reduction_tensor * reduction_stride
 
-            values = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
+            values = tl.load(s_ptr + offsets, mask=mask, other=float("-inf"))
             local_max = tl.max(values,axis=0)
             max_val = tl.maximum(max_val,local_max)
 
         denominator = 0.0
         for i in tl.range(0,reduction_size, BLOCK_SIZE):
-            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            reduction_tensor = i + tl.arange(0,BLOCK_SIZE)
             mask = reduction_tensor < reduction_size
             offsets = base_offset + reduction_tensor * reduction_stride
 
-            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
+            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf"))
             denominator += tl.sum(tl.exp(vals-max_val),axis=0)
 
-        denominator = 0.0
         for i in tl.range(0,reduction_size, BLOCK_SIZE):
-            reduction_tensor = tl.arange(0,BLOCK_SIZE)
+            reduction_tensor = i + tl.arange(0,BLOCK_SIZE)
             mask = reduction_tensor < reduction_size
             offsets = base_offset + reduction_tensor * reduction_stride
+            o_offsets = o_base_offset + reduction_tensor * o_reduction_stride
 
-            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf")
-            tl.store(o_ptr + offsets, tl.exp(vals-max_val)/denominator)
+            vals = tl.load(s_ptr + offsets, mask=mask, other=float("-inf"))
+            tl.store(o_ptr + o_offsets, tl.exp(vals-max_val)/denominator, mask=mask)
 
 
     def safe_softmax(S,
                      dim=None
                      ):
-        output = torch.empty(S, dtype=S.dtype, device=S.dtype)
+        output = torch.empty(S.shape, dtype=S.dtype, device=S.device)
         stride_sb,stride_sn,stride_ss,stride_sh = S.stride()
-        stride_ob,stride_on,stride_os,stride_oh = O.stride()
+        stride_ob,stride_on,stride_os,stride_oh = output.stride()
         D0, D1, D2, D3 = S.shape
         grid_size = 0
-        for idx,dim in enumerate(S.shape)
-            if idx != dim:
-                grid_size += dim
-        grid = (grid_size,)
+
+        soft_max_dim = dim
+        if soft_max_dim > 4 or soft_max_dim < -4:
+            return
+        if soft_max_dim < 0:
+            soft_max_dim = soft_max_dim + len(S.shape)
         
-        safe_softmax_kernel(s_ptr,
-                            o_ptr,
+        grid_size = 1
+
+        for axis, size in enumerate(S.shape):
+            if axis != soft_max_dim:
+                grid_size *= size
+
+        grid = (grid_size,)
+        safe_softmax_kernel[grid](S,
+                            output,
                             D0,
                             D1,
                             D2,
                             D3,
-                            dim,
+                            soft_max_dim,
                             stride_sb,stride_sn,stride_ss,stride_sh, 
                             stride_ob,stride_on,stride_os,stride_oh,
                             BLOCK_SIZE=128
                             )
+
+        return output
 
     b = 2
     n = 2
@@ -354,9 +377,9 @@ else:
         # Testing Softmax
         output3 = safe_softmax_last_dim(output1)
         output4 = torch.softmax(output2,dim=-1)
-        print(torch.allclose(output3, output4, atol=1e-5))
-        print("matmul allclose:",
-              torch.allclose(output1, output2, atol=1e-5, rtol=1e-5))
+        output5 = safe_softmax(output1,dim=-1)
+        print(torch.allclose(output3, output5, atol=1e-5))
+        print("matmul allclose:", torch.allclose(output1, output2, atol=1e-5, rtol=1e-5))
 
         print("max abs error:",
               (output1 - output2).abs().max().item())
