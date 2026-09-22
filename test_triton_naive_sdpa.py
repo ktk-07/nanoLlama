@@ -377,8 +377,18 @@ else:
         # Testing Softmax
         output3 = safe_softmax_last_dim(output1)
         output4 = torch.softmax(output2,dim=-1)
-        output5 = safe_softmax(output1,dim=-1)
-        print(torch.allclose(output3, output5, atol=1e-5))
+
+        # Testing actual softmax
+        for dim in range(4):
+            tri = safe_softmax(output1, dim=dim)
+            ref = torch.softmax(output1, dim=dim)
+
+            print(
+                dim,
+                torch.allclose(tri, ref, atol=1e-5, rtol=1e-5),
+                (tri - ref).abs().max().item()
+            )
+
         print("matmul allclose:", torch.allclose(output1, output2, atol=1e-5, rtol=1e-5))
 
         print("max abs error:",
