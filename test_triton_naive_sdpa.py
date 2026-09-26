@@ -124,6 +124,55 @@ else:
 
         return output
 
+    # Matmul with several optimisations
+    # - Group Ordering (Implementing)
+    #   - Basically the output tiles you deciding the order of execution yourself
+    #   - Increase spatial locality by 
+    # - Memory coalescing / access-pattern sanity (To Be Implemented)
+    # - Sweep num_warps
+    # - Sweep num_stages
+    # - Benchmark block sizes
+    def matmul_optimised_kernel(Q, 
+                                K, 
+                                output, 
+                                B_Q, 
+                                N_Q, 
+                                row, 
+                                col, 
+                                inner_dim, 
+                                stride_qb,stride_qn,stride_qs,stride_qh, 
+                                stride_kb,stride_kn,stride_kh,stride_ks,
+                                stride_ob,stride_on,stride_oqs,stride_oks,
+                                BLOCK_Q,
+                                BLOCK_K, 
+                                BLOCK_INNER_DIM, 
+                                scaled
+                                ):
+        pass
+        
+
+    def matmul_optimised(Q,
+                         K,
+                         scaled=False
+                         ):
+        B_Q,N_Q,S_Q,H_Q = Q.shape
+        B_K,N_K,H_K,S_K = K.shape
+        stride_qb,stride_qn,stride_qs,stride_qh = Q.stride()
+        stride_kb,stride_kn,stride_kh,stride_ks = K.stride()
+
+        output = torch.empty((), dtype=Q.dtype, device= Q.device)
+        stride_ob,stride_on,stride_oqs,stride_oks = output.stride()
+        output = 
+        BLOCK_Q = 32
+        BLOCK_K = 32
+        BLOCK_INNER_DIM = 32 # Block Size
+
+        NUM_Q_BLOCKS = tl.cdiv(S_Q, BLOCK_Q)
+        NUM_K_BLOCKS = tl.cdiv(S_K, BLOCK_K)
+        grid = (B_Q * N_Q , NUM_Q_BLOCKS * NUM_K_BLOCKS)
+
+        matmul_optimised_kernel[grid]()
+
     # B x N x S x H
     @triton.jit
     def safe_softmax_kernel_last_dim(s_ptr,
@@ -382,6 +431,18 @@ else:
         for dim in range(4):
             tri = safe_softmax(output1, dim=dim)
             ref = torch.softmax(output1, dim=dim)
+
+            print(
+                dim,
+                torch.allclose(tri, ref, atol=1e-5, rtol=1e-5),
+                (tri - ref).abs().max().item()
+            )
+
+        x = torch.randn(2, 3, 5, 7, device="cuda")
+        x = x.permute(0, 2, 1, 3)
+        for dim in range(4):
+            tri = safe_softmax(x, dim=dim)
+            ref = torch.softmax(x, dim=dim)
 
             print(
                 dim,
