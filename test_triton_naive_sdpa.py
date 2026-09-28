@@ -131,7 +131,9 @@ else:
     # - Memory coalescing / access-pattern sanity (To Be Implemented)
     # - Sweep num_warps
     # - Sweep num_stages
-    # - Benchmark block sizes
+    # - Benchmark block sizes block-size benchmarking
+    # - basic profiling
+    @triton.jit
     def matmul_optimised_kernel(Q, 
                                 K, 
                                 output, 
@@ -143,13 +145,92 @@ else:
                                 stride_qb,stride_qn,stride_qs,stride_qh, 
                                 stride_kb,stride_kn,stride_kh,stride_ks,
                                 stride_ob,stride_on,stride_oqs,stride_oks,
-                                BLOCK_Q,
-                                BLOCK_K, 
-                                BLOCK_INNER_DIM, 
+                                QROUP_SIZE_Q:tl.constexpr,
+                                NUM_Q_BLOCKS:tl.constexpr,
+                                NUM_K_BLOCKS:tl.constexpr,
+                                BLOCK_Q:tl.constexpr,
+                                BLOCK_K:tl.constexpr, 
+                                BLOCK_INNER_DIM:tl.constexpr, 
                                 scaled
                                 ):
-        pass
-        
+
+        # Use pid0 and compute offsets
+        pid0 = tl.program_id(axis=0)
+        b_idx = pid0 // N_Q
+        n_idx = pid0 % N_Q
+
+        q_base_offset = b_idx * stride_qb + stride_qn
+        k_base_offset = b_idx * stride_kb + stride_kn
+        o_base_offset = b_idx * stride_ob + stride_on
+
+        # Use pid and compute block offsets
+        # This would be the normal way of traversing i guess? nope
+        # pid1 = tl.program_id(axis=1)
+        # bq_idx = pid1 // NUM_K_BLOCKS
+        # bk_idx = pid1 % NUM_K_BLOCKS
+        # rows = bq_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+        # cols = bk_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+
+        # This is column major traversal however it is not group ordering 
+        # pid1 = tl.program_id(axis=1)
+        # bk_idx = pid1 // NUM_Q_BLOCKS
+        # bq_idx = pid1 % NUM_Q_BLOCKS
+
+        # row = bq_idx * BLOCK_Q + tl.arange(0,BLOCK_Q)
+        # col = bk_idx * BLOCK_K + tl.arange(0,BLOCK_K)
+
+        # Grouped ordering is:
+        # Column major traversal within a small Group Size q
+        # It limits how far down Q you go before moving to the next K tile.
+        # Reason being: If NUM_Q_BLOCKS is large, you may touch a huge number of different Q tiles before returning to another K column, which can make the working set too large for cache
+        pid1 = tl.program_id(axis=1)
+        programs_per_group = GROUP_SIZE_Q * NUM_K_BLOCKS
+        group_id = pid1 // programs_per_group
+        pid_in_group = group_id % programs_per_group
+        q_inside_group = pid_in_group % GROUP_SIZE_Q
+        k_idx = pid_in_group // GROUP_SIZE_Q
+        q_idx = group_id * GROUP_SIZE_Q + q_inside_group
+
+        rows_start = q_dix * BLOCK_Q + tl.arange(0,BLOCK_Q)
+        cols_start = k_dix * BLOCK_K + tl.arange(0,BLOCK_K)
+
+        # Shouldnt we have row mask too?
+        # Shouldnt we have col mask too?
+        # But how to apply them ?
+        # Will be handled by the loop inside
+
+        # can we take the dtype of like the Q or K pointer isnt that better?
+        acc = tl.zeros((BLOCK_Q,BLOCK_K), dtype=tl.float32)
+        for i in tl.range(0, inner_dim, BLOCK_INNER_DIM):
+            inner = i + tl.arange(0, BLOCK_INNER_DIM)
+            row_idxes = rows_start + inner[:,] 
+            col_idxes = cols_start + inner[,:]
+
+            q_idxes = q_base_offset + rows_indexes
+            q_mask = inner[:,] < inner_dim
+            k_idxes = k_base_offset
+            k_mask = inner[,:] < inner_dim
+            q = tl.load(q_ptr + q_idxes)
+            k = tl.load(k_ptr + k_idxes)
+
+            acc += tl.dot(q,k)
+
+
+        o_idxes = o_base_off
+        o_mask = 
+
+        # Write to output
+        tl.store
+
+
+
+
+
+
+
+
+
+
 
     def matmul_optimised(Q,
                          K,
@@ -162,16 +243,37 @@ else:
 
         output = torch.empty((), dtype=Q.dtype, device= Q.device)
         stride_ob,stride_on,stride_oqs,stride_oks = output.stride()
-        output = 
         BLOCK_Q = 32
         BLOCK_K = 32
         BLOCK_INNER_DIM = 32 # Block Size
 
+        GROUP_SIZE_Q = 3
         NUM_Q_BLOCKS = tl.cdiv(S_Q, BLOCK_Q)
         NUM_K_BLOCKS = tl.cdiv(S_K, BLOCK_K)
+        # For group ordering, we decide the order in which we compute which output tile
+        # We do that by flattening it deciding the order of computation
         grid = (B_Q * N_Q , NUM_Q_BLOCKS * NUM_K_BLOCKS)
 
-        matmul_optimised_kernel[grid]()
+        matmul_optimised_kernel[grid](Q, 
+                                      K, 
+                                      output, 
+                                      B_Q, 
+                                      N_Q, 
+                                      row, 
+                                      col, 
+                                      inner_dim, 
+                                      stride_qb,stride_qn,stride_qs,stride_qh, 
+                                      stride_kb,stride_kn,stride_kh,stride_ks,
+                                      stride_ob,stride_on,stride_oqs,stride_oks,
+                                      GROUP_SIZE_Q,
+                                      NUM_Q_BLOCKS,
+                                      NUM_K_BLOCKS,
+                                      BLOCK_Q,
+                                      BLOCK_K, 
+                                      BLOCK_INNER_DIM, 
+                                      scaled
+                                      ):
+
 
     # B x N x S x H
     @triton.jit
