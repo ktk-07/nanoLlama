@@ -134,9 +134,9 @@ else:
     # - Benchmark block sizes block-size benchmarking
     # - basic profiling
     @triton.jit
-    def matmul_optimised_kernel(Q, 
-                                K, 
-                                output, 
+    def matmul_optimised_kernel(q_ptr, 
+                                k_ptr, 
+                                output_ptr, 
                                 B_Q, 
                                 N_Q, 
                                 row, 
@@ -145,13 +145,13 @@ else:
                                 stride_qb,stride_qn,stride_qs,stride_qh, 
                                 stride_kb,stride_kn,stride_kh,stride_ks,
                                 stride_ob,stride_on,stride_oqs,stride_oks,
-                                QROUP_SIZE_Q:tl.constexpr,
+                                GROUP_SIZE_Q:tl.constexpr,
                                 NUM_Q_BLOCKS:tl.constexpr,
                                 NUM_K_BLOCKS:tl.constexpr,
                                 BLOCK_Q:tl.constexpr,
                                 BLOCK_K:tl.constexpr, 
                                 BLOCK_INNER_DIM:tl.constexpr, 
-                                scaled
+                                scaled:tl.constexpr
                                 ):
 
         # Use pid0 and compute offsets
@@ -159,9 +159,9 @@ else:
         b_idx = pid0 // N_Q
         n_idx = pid0 % N_Q
 
-        q_base_offset = b_idx * stride_qb + stride_qn
-        k_base_offset = b_idx * stride_kb + stride_kn
-        o_base_offset = b_idx * stride_ob + stride_on
+        q_base_offset = b_idx * stride_qb + n_idx * stride_qn
+        k_base_offset = b_idx * stride_kb + n_idx * stride_kn
+        o_base_offset = b_idx * stride_ob + n_idx * stride_on
 
         # Use pid and compute block offsets
         # This would be the normal way of traversing i guess? nope
@@ -183,53 +183,61 @@ else:
         # Column major traversal within a small Group Size q
         # It limits how far down Q you go before moving to the next K tile.
         # Reason being: If NUM_Q_BLOCKS is large, you may touch a huge number of different Q tiles before returning to another K column, which can make the working set too large for cache
+        # 0. Total number of programs is NUM_Q_BLOCKS * NUM_K_BLOCKS
+        # 1. You want to index the program block by block
+        # 2. 1 block is GROUP_SIZE_Q * NUM_K_BLOCKS
+        # Getting the program_idx
         pid1 = tl.program_id(axis=1)
-        programs_per_group = GROUP_SIZE_Q * NUM_K_BLOCKS
-        group_id = pid1 // programs_per_group
-        pid_in_group = group_id % programs_per_group
-        q_inside_group = pid_in_group % GROUP_SIZE_Q
-        k_idx = pid_in_group // GROUP_SIZE_Q
-        q_idx = group_id * GROUP_SIZE_Q + q_inside_group
+        # Getting the number of BLOCKS
+        group_size = GROUP_SIZE_Q * NUM_K_BLOCKS
+        group_id = pid1 // group_size
 
-        rows_start = q_dix * BLOCK_Q + tl.arange(0,BLOCK_Q)
-        cols_start = k_dix * BLOCK_K + tl.arange(0,BLOCK_K)
+        first_q = group_id * GROUP_SIZE_Q
+        # We cant just use GROUP_SIZE_Q cause the last group might have number of elements < GROUP_SIZE_Q
+        active_group_q = tl.minimum(NUM_Q_BLOCKS - first_q, GROUP_SIZE_Q)
 
-        # Shouldnt we have row mask too?
-        # Shouldnt we have col mask too?
-        # But how to apply them ?
-        # Will be handled by the loop inside
+        # total number of items in group still GROUP_SIZE_Q * NUM_K_BLOCKS
+        # Mod group_size means, we are incrementing the group_id once group_size = GROUP_SIZE_Q * NUM_K_BLOCKS, thus pid_in_group is as follows
+        pid_in_group = pid1 % group_size
+        # Since we want it compute the output row, k_idx becomes the slow changing index
+        k_idx = pid_in_group // active_group_q
+        q_idx_of_group = pid_in_group % active_group_q
+        q_idx = first_q + q_idx_of_group
 
-        # can we take the dtype of like the Q or K pointer isnt that better?
+        # Base offset for the row of cols of each block
+        rows_block = q_idx * BLOCK_Q + tl.arange(0,BLOCK_Q)
+        cols_block = k_idx * BLOCK_K + tl.arange(0,BLOCK_K)
+
+        rows_block_mask = (rows_block < row)[:, None]
+        cols_block_mask = (cols_block < col)[None, :]
+
         acc = tl.zeros((BLOCK_Q,BLOCK_K), dtype=tl.float32)
+        # can we take the dtype of like the Q or K pointer isnt that better?
         for i in tl.range(0, inner_dim, BLOCK_INNER_DIM):
-            inner = i + tl.arange(0, BLOCK_INNER_DIM)
-            row_idxes = rows_start + inner[:,] 
-            col_idxes = cols_start + inner[,:]
+            inner_block = i + tl.arange(0,BLOCK_INNER_DIM)
+            inner_row_block = inner_block[None,:]
+            inner_col_block = inner_block[:,None]
+            inner_mask = inner_block < inner_dim 
+            inner_row_block_mask = inner_mask[None,:] 
+            inner_col_block_mask = inner_mask[:,None]
 
-            q_idxes = q_base_offset + rows_indexes
-            q_mask = inner[:,] < inner_dim
-            k_idxes = k_base_offset
-            k_mask = inner[,:] < inner_dim
-            q = tl.load(q_ptr + q_idxes)
-            k = tl.load(k_ptr + k_idxes)
-
-            acc += tl.dot(q,k)
+            row_idxes = q_base_offset + rows_block[:, None] * stride_qs + inner_row_block * stride_qh            
+            row_mask = rows_block_mask & inner_row_block_mask
+            col_idxes = k_base_offset + cols_block[None,:] * stride_ks + inner_col_block * stride_kh
+            col_mask = cols_block_mask & inner_col_block_mask
 
 
-        o_idxes = o_base_off
-        o_mask = 
+            q = tl.load(q_ptr + row_idxes, mask=row_mask, other=0.0)
+            k = tl.load(k_ptr + col_idxes, mask=col_mask, other=0.0)
+            acc += tl.dot(q,k input_precision="ieee")
+
+        if scaled:
+            acc = acc / tl.sqrt(inner_dim)
 
         # Write to output
-        tl.store
-
-
-
-
-
-
-
-
-
+        output_block_mask = rows_block_mask & cols_block_mask
+        output_idxes = o_base_offset + rows_block[:,None] * stride_oqs + cols_block[None,:] * stride_oks
+        tl.store(output_ptr + output_idxes, acc, mask=output_block_mask)
 
 
     def matmul_optimised(Q,
@@ -238,21 +246,29 @@ else:
                          ):
         B_Q,N_Q,S_Q,H_Q = Q.shape
         B_K,N_K,H_K,S_K = K.shape
+
+        assert B_Q == B_K
+        assert N_Q == N_K
+        assert H_Q == H_K
+
         stride_qb,stride_qn,stride_qs,stride_qh = Q.stride()
         stride_kb,stride_kn,stride_kh,stride_ks = K.stride()
 
-        output = torch.empty((), dtype=Q.dtype, device= Q.device)
+        output = torch.empty((B_Q, N_Q, S_Q, S_K),dtype=Q.dtype,device=Q.device)
         stride_ob,stride_on,stride_oqs,stride_oks = output.stride()
         BLOCK_Q = 32
         BLOCK_K = 32
         BLOCK_INNER_DIM = 32 # Block Size
 
         GROUP_SIZE_Q = 3
-        NUM_Q_BLOCKS = tl.cdiv(S_Q, BLOCK_Q)
-        NUM_K_BLOCKS = tl.cdiv(S_K, BLOCK_K)
+        NUM_Q_BLOCKS = triton.cdiv(S_Q, BLOCK_Q)
+        NUM_K_BLOCKS = triton.cdiv(S_K, BLOCK_K)
         # For group ordering, we decide the order in which we compute which output tile
         # We do that by flattening it deciding the order of computation
         grid = (B_Q * N_Q , NUM_Q_BLOCKS * NUM_K_BLOCKS)
+        row = S_Q
+        col = S_K
+        inner_dim = H_Q
 
         matmul_optimised_kernel[grid](Q, 
                                       K, 
@@ -272,8 +288,9 @@ else:
                                       BLOCK_K, 
                                       BLOCK_INNER_DIM, 
                                       scaled
-                                      ):
+                                      )
 
+        return output
 
     # B x N x S x H
     @triton.jit
