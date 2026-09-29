@@ -229,7 +229,7 @@ else:
 
             q = tl.load(q_ptr + row_idxes, mask=row_mask, other=0.0)
             k = tl.load(k_ptr + col_idxes, mask=col_mask, other=0.0)
-            acc += tl.dot(q,k input_precision="ieee")
+            acc += tl.dot(q,k, input_precision="ieee")
 
         if scaled:
             acc = acc / tl.sqrt(inner_dim)
@@ -535,13 +535,15 @@ else:
     if device == "cuda": 
         Q = torch.randn(b,n,s,h, device=device, dtype=torch.float32)
         K = torch.randn(b,n,s,h, device=device, dtype=torch.float32)    
-        K_tranposed = K.permute(0,1,3,2)
+        K_transposed = K.permute(0,1,3,2)
         V = torch.randn(b,n,s,h)    
         O = torch.randn(b,n,s,h)    
         # Testing Matmul
-        output1 = matmul(Q,K_tranposed)               
-        output2 = Q @ K_tranposed
+        output1 = matmul(Q,K_transposed)               
+        output2 = Q @ K_transposed
         print(torch.allclose(output1, output2, atol=1e-5))
+        output1_optimised = matmul_optimised(Q,K_transposed,scaled=False)
+
         # Testing Softmax
         output3 = safe_softmax_last_dim(output1)
         output4 = torch.softmax(output2,dim=-1)
@@ -570,6 +572,7 @@ else:
             )
 
         print("matmul allclose:", torch.allclose(output1, output2, atol=1e-5, rtol=1e-5))
+        print("matmul optimised allclose:", torch.allclose(output1_optimised, output2, atol=1e-5, rtol=1e-5))
 
         print("max abs error:",
               (output1 - output2).abs().max().item())
