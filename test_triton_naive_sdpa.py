@@ -125,14 +125,64 @@ else:
         return output
 
     # Matmul with several optimisations
-    # - Group Ordering (Implementing)
+    # - Group Ordering (Implemented)
     #   - Basically the output tiles you deciding the order of execution yourself
-    #   - Increase spatial locality by 
-    # - Memory coalescing / access-pattern sanity (To Be Implemented)
-    # - Sweep num_warps
-    # - Sweep num_stages
+    #   - Increase temporal locality of Q.
+    # - Memory coalescing / access-pattern sanity (Just need to understand, not really implemented in Triton)
+    # - Sweep num_warps  (It is a launch/compiler configuration)
+    #   - How many warps cooperate to execute 1 Triton program
+    #   - scheduler switches to another warp
+    #   - thread/warp-level pipelining
+    # - Sweep num_stages (It is a launch/compiler configuration)
+    #   - Basically async copies https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html
+    #       - use asynchronous data copies to prefetch data from global memory to shared memory.
+    #   - How deeply triton pipelines the loop inside that program to overlap memory movement with computation
+    #   - It is about software pipelining, particularly around loops that load data and compute
+    #   - software pipelining depth
+    #   - More stages more pipelines buffered which results in more shared memory consumption
+    #   - Uses instruction / iteration level pipelining
+    #   - more stages better memory hiding but the tradeoff is more stages -> more SMEM/program -> potentially fewer resident programs -> potentially lower occupancy}
     # - Benchmark block sizes block-size benchmarking
     # - basic profiling
+
+
+    # 2 types of configurations here
+    # 1. Kernel meta-parameters:
+    # 2. Launch/compiler configuration
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {
+                    "BLOCK_M": 32,
+                    "BLOCK_N": 32,
+                    "BLOCK_K": 32,
+                },
+                num_warps=4,
+                num_stages=2,
+            ),
+
+            triton.Config(
+                {
+                    "BLOCK_M": 64,
+                    "BLOCK_N": 64,
+                    "BLOCK_K": 32,
+                },
+                num_warps=4,
+                num_stages=3,
+            ),
+
+            triton.Config(
+                {
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "BLOCK_K": 32,
+                },
+                num_warps=8,
+                num_stages=3,
+            ),
+        ],
+        key=["M", "N", "K"],
+    )
     @triton.jit
     def matmul_optimised_kernel(q_ptr, 
                                 k_ptr, 
@@ -178,6 +228,15 @@ else:
 
         # row = bq_idx * BLOCK_Q + tl.arange(0,BLOCK_Q)
         # col = bk_idx * BLOCK_K + tl.arange(0,BLOCK_K)
+
+
+        # If row major ordering: Q gets reused alot more while K changes, temporal reuse for Q is very high
+        # If col major ordering: K gets reused alot more while Q changes, temporal reuse for K is very high
+        # Grouped ordering tries to balance these by using a small Q group
+        # Grouped ordering = which tile runs next = temporal locality / L2 reuse
+        # Memory coalescing = how addresses inside a tile are laid out = efficient global-memory transactions done by the triton compiler
+
+
 
         # Grouped ordering is:
         # Column major traversal within a small Group Size q
