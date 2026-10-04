@@ -153,41 +153,38 @@ else:
         configs=[
             triton.Config(
                 {
-                    "BLOCK_M": 32,
-                    "BLOCK_N": 32,
+                    "BLOCK_Q": 32,
                     "BLOCK_K": 32,
+                    "BLOCK_INNER_DIM": 32,
                 },
                 num_warps=4,
                 num_stages=2,
             ),
-
             triton.Config(
                 {
-                    "BLOCK_M": 64,
-                    "BLOCK_N": 64,
-                    "BLOCK_K": 32,
+                    "BLOCK_Q": 64,
+                    "BLOCK_K": 64,
+                    "BLOCK_INNER_DIM": 32,
                 },
                 num_warps=4,
                 num_stages=3,
             ),
-
             triton.Config(
                 {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 64,
-                    "BLOCK_K": 32,
+                    "BLOCK_Q": 128,
+                    "BLOCK_K": 64,
+                    "BLOCK_INNER_DIM": 32,
                 },
                 num_warps=8,
                 num_stages=3,
             ),
         ],
-        key=["M", "N", "K"],
+        key=["row", "col", "inner_dim"],
     )
     @triton.jit
     def matmul_optimised_kernel(q_ptr, 
                                 k_ptr, 
                                 output_ptr, 
-                                B_Q, 
                                 N_Q, 
                                 row, 
                                 col, 
@@ -196,13 +193,17 @@ else:
                                 stride_kb,stride_kn,stride_kh,stride_ks,
                                 stride_ob,stride_on,stride_oqs,stride_oks,
                                 GROUP_SIZE_Q:tl.constexpr,
-                                NUM_Q_BLOCKS:tl.constexpr,
-                                NUM_K_BLOCKS:tl.constexpr,
-                                BLOCK_Q:tl.constexpr,
-                                BLOCK_K:tl.constexpr, 
-                                BLOCK_INNER_DIM:tl.constexpr, 
+                                BLOCK_Q: tl.constexpr,
+                                BLOCK_K: tl.constexpr,
+                                BLOCK_INNER_DIM: tl.constexpr,
                                 scaled:tl.constexpr
                                 ):
+
+
+
+
+        num_q_blocks = tl.cdiv(row, BLOCK_Q)
+        num_k_blocks = tl.cdiv(col, BLOCK_K)
 
         # Use pid0 and compute offsets
         pid0 = tl.program_id(axis=0)
@@ -248,12 +249,12 @@ else:
         # Getting the program_idx
         pid1 = tl.program_id(axis=1)
         # Getting the number of BLOCKS
-        group_size = GROUP_SIZE_Q * NUM_K_BLOCKS
+        group_size = GROUP_SIZE_Q * num_k_blocks
         group_id = pid1 // group_size
 
         first_q = group_id * GROUP_SIZE_Q
         # We cant just use GROUP_SIZE_Q cause the last group might have number of elements < GROUP_SIZE_Q
-        active_group_q = tl.minimum(NUM_Q_BLOCKS - first_q, GROUP_SIZE_Q)
+        active_group_q = tl.minimum(num_q_blocks - first_q, GROUP_SIZE_Q)
 
         # total number of items in group still GROUP_SIZE_Q * NUM_K_BLOCKS
         # Mod group_size means, we are incrementing the group_id once group_size = GROUP_SIZE_Q * NUM_K_BLOCKS, thus pid_in_group is as follows
@@ -324,15 +325,20 @@ else:
         NUM_K_BLOCKS = triton.cdiv(S_K, BLOCK_K)
         # For group ordering, we decide the order in which we compute which output tile
         # We do that by flattening it deciding the order of computation
-        grid = (B_Q * N_Q , NUM_Q_BLOCKS * NUM_K_BLOCKS)
+        # grid = (B_Q * N_Q , NUM_Q_BLOCKS * NUM_K_BLOCKS)
+
+        grid = lambda META: (
+                            B_Q * N_Q,
+                            triton.cdiv(S_Q, META["BLOCK_Q"]) * triton.cdiv(S_K, META["BLOCK_K"]),
+                            )
         row = S_Q
         col = S_K
         inner_dim = H_Q
 
+
         matmul_optimised_kernel[grid](Q, 
                                       K, 
-                                      output, 
-                                      B_Q, 
+                                      output,
                                       N_Q, 
                                       row, 
                                       col, 
@@ -340,13 +346,8 @@ else:
                                       stride_qb,stride_qn,stride_qs,stride_qh, 
                                       stride_kb,stride_kn,stride_kh,stride_ks,
                                       stride_ob,stride_on,stride_oqs,stride_oks,
-                                      GROUP_SIZE_Q,
-                                      NUM_Q_BLOCKS,
-                                      NUM_K_BLOCKS,
-                                      BLOCK_Q,
-                                      BLOCK_K, 
-                                      BLOCK_INNER_DIM, 
-                                      scaled
+                                      GROUP_SIZE_Q=GROUP_SIZE_Q,
+                                      scaled=scaled
                                       )
 
         return output
