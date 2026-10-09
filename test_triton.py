@@ -181,7 +181,7 @@ else:
                                       v_ptr,
                                       s_ptr,
                                       p_ptr,
-                                      v_ptr,
+                                      o_ptr,
                                       input_dimensions,
                                       output_dimensions,
                                       BLOCK_SIZE=1024
@@ -227,7 +227,7 @@ else:
 
         # Feels like im not indexing correctly too
         # Rescaled S / sqrt(H)
-        tl.store(s_ptr + row_idx, accumulator / tl.sqrt(input_dimensions[3], total_sum) 
+        #tl.store(s_ptr + row_idx, accumulator / tl.sqrt(input_dimensions[3], total_sum) )
 
         # Apply Mask 
 
@@ -279,7 +279,7 @@ else:
     # 1 triton program owns one block of query tokens for one batch_head pair
     # Each program is responsible for BLOCK_Q query tokens and their complete attention output over all keys
     def flash_attn_kernel(q_ptr,
-                          k_ptr,
+                          k_ptr, # this is the k_tranposed, not too sure if thats how they are doing it
                           v_ptr,
                           output_ptr,
                           N,
@@ -309,27 +309,46 @@ else:
         q_base_offset = b_idx * stride_qb +  n_idx * stride_qn
         k_base_offset = b_idx * stride_kb +  n_idx * stride_kn
         v_base_offset = b_idx * stride_vb +  n_idx * stride_vn
-        o_base_offset = b_idx * stride_ob +  n_idx * stride_0n
+        o_base_offset = b_idx * stride_ob +  n_idx * stride_on
 
         rows = pid1 * BLOCK_Q + tl.arange(0, BLOCK_Q)
-        row_mask = rows < row
+        rows_block_mask = rows < row
 
-        # Matmul one BLOCK_Q of QK^T first
+        # Accumulator should just be BLOCK_Q x HEAD_DIM
+        final_acc = tl.zeros((BLOCK_Q, col), dtype=tl.float32)
+        # We want to do the kernel fusion for the entire inner_dim reight?
         for j in range(0, col, BLOCK_KV):
-            col = i + tl.arange(0,BLOCK_INNER_DIM);
-            col_mask = cols < col
+            cols = i + tl.arange(0,BLOCK_KV)
+            cols_block_mask = cols < col
 
+            # Accumulator should it be BLOCK_Q by BLOCK_KV or just BLOCK_Q x 1
+            # Reading the FlashAttention paper its say B_r x B_c, so this is correct
+            matmul_acc = tl.zeros((BLOCK_Q,BLOCK_KV), dtype=tl.float32)
+            # Matmul one BLOCK_Q of QK^T first
+            # Im not going to optimise it first with like group ordering, i think we would have to somehow change the way we traverse a loop?
+
+            # We want to do the kernel fusion for the entire inner_dim right?
             for k in range(0, inner_dim, BLOCK_INNER_DIM):
                 inner = i + tl.arange(0,BLOCK_INNER_DIM);
-                inner_mask = inner < inner_dim
+                inner_block_mask = inner < inner_dim
 
-        # 3 Running Statistic/States to Keep
-        # 1. runnning max
-        # 2. running denominator
-        # 3. running unnormalized weighted values
+                row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
+                col_mask =  cols_block_mask[None,:] & inner_block_mask[:,None]
 
+                row_idxes = q_base_offset + row[:,None] * stride_qs + inner[None,:] * stride_qh
+                col_idxes = k_base_offset + col[None,:] * stride_ks + inner[:,None] * stride_kh
 
-        # Running softmax with running 
+                q =  tl.load( q_base_offset + row_idxes, mask=row_mask, other=0.0)
+                k_transposed = tl.load(k_base_offset + col_idxes, mask=col_mask, other=0.0)
+                matmul_acc += tl.dot(q,k_transposed, input_precision="IEEE")
+
+            # 3 Running Statistic/States to Keep, technically 6 cause 3 for local then 3 for global meaning the entire 1 x embedding_dim row
+            # 1. runnning max
+            # 2. running denominator
+            # 3. running unnormalized weighted values
+
+            # Soft max
+
 
 
 
