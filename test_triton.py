@@ -190,7 +190,7 @@ else:
         # Matrix Multiplication S = Q @ K^T
         # How do we want to speed up the matrix multiplication?
         # Load a block of row of Q and loadd a block of row of K 
-        # Then load throught the 
+        # Then load through the 
 
         # Need to Index K in a Column-Major Manner
         # Optimisation we can make to Matmul
@@ -236,10 +236,19 @@ else:
         # O = P @ V
 
 
-
         pass
 
-    def scaled_dot_product_attn(Q,K,V,mask):
+        # It should be 3 separate kernels
+        # 1. safe_softmax (No point for it to be the optimised softmax from the other 2 prerequisisite papers)
+        # 2. matmul (It can and should be the most optimsed) Reused for QK^T and 0 = PV
+        # Kernel 1: S = Q @ K^T / sqrt(H)
+        # Kernel 2: P = softmax(S + mask)   # or apply mask before softmax
+        # Kernel 3: O = P @ V
+    def scaled_dot_product_attn(Q,
+                                K,
+                                V,
+                                mask
+                                ):
         # Defining the outputs as well as intermediate tensors required
         B, N, S, H = Q.shape
         S = torch.empty_like((B,N,S,S))
@@ -247,28 +256,124 @@ else:
         O = torch.empty_like(Q.shape)
         grid = (B*N, S, H) # Grid should be actual work/output tiles your kernel is responsible 
 
+
+
         return scaled_dot_product_attn[grid](Q,K,V,S,P,O, Q.shape, O.shape, BLOCK_SIZE=1024)
 
 
     # SELF-ATTENTION DOES NOT NEED O(n^2) MEMORY: https://arxiv.org/pdf/2112.05682
+    # I will implement this last, after flash attention forward and backward
     @triton.jit
     def memory_efficient_attn_kernel():
         # 1. We dont want to materialise the S and the P 
         # 2. 
-
         pass
 
     def memory_efficient_attn(Q,K,V,mask):
-        grid = ()
-        return memory_efficient_attn_kernel[grid](Q,K,V)
-
-    # Compare Speed of softmax in pytorch and triton
-    def scaled_dot_product_attn_flash():
+        # grid = ()
+        # return memory_efficient_attn_kernel[grid](Q,K,V)
         pass
 
     # Compare Speed of softmax in pytorch and triton
-    def scaled_dot_product_attn_flash():
+    # We will do it without accomodating the mask first
+    # 1 triton program owns one block of query tokens for one batch_head pair
+    # Each program is responsible for BLOCK_Q query tokens and their complete attention output over all keys
+    def flash_attn_kernel(q_ptr,
+                          k_ptr,
+                          v_ptr,
+                          output_ptr,
+                          N,
+                          row,
+                          col,
+                          inner_dim,
+                          stride_qb, stride_qn, stride_qs, stride_qh,
+                          stride_kb, stride_kn, stride_kh, stride_ks,
+                          stride_vb, stride_vn, stride_vh, stride_vs,
+                          stride_ob, stride_on, stride_oqs, stride_oks,
+
+                          BLOCK_Q: tl.constexpr,
+                          BLOCK_KV: tl.constexpr,
+                          BLOCK_INNER_DIM: tl.constexpr, 
+                          TILE_Q: tl.constexpr, # T_r
+                          TILE_KV: tl.constexpr, # T_c
+                          ):
+
+        pid0 = tl.program_id(axis=0)
+        pid1 = tl.program_id(axis=1)
+
+        # Need to compute the base offset first
+        # Because we flatten B * N we need to extract them out
+        b_idx = pid0 // N
+        n_idx = pid0 % N
+
+        q_base_offset = b_idx * stride_qb +  n_idx * stride_qn
+        k_base_offset = b_idx * stride_kb +  n_idx * stride_kn
+        v_base_offset = b_idx * stride_vb +  n_idx * stride_vn
+        o_base_offset = b_idx * stride_ob +  n_idx * stride_0n
+
+        rows = pid1 * BLOCK_Q + tl.arange(0, BLOCK_Q)
+        row_mask = rows < row
+
+        # Matmul one BLOCK_Q of QK^T first
+        for j in range(0, col, BLOCK_KV):
+            col = i + tl.arange(0,BLOCK_INNER_DIM);
+            col_mask = cols < col
+
+            for k in range(0, inner_dim, BLOCK_INNER_DIM):
+                inner = i + tl.arange(0,BLOCK_INNER_DIM);
+                inner_mask = inner < inner_dim
+
+        # 3 Running Statistic/States to Keep
+        # 1. runnning max
+        # 2. running denominator
+        # 3. running unnormalized weighted values
+
+
+        # Running softmax with running 
+
+
+
+
+    # Compare Speed of softmax in pytorch and triton
+    def flash_attn(Q,
+                   K,
+                   V
+                   ):
+
+        # In the paper S = N (sequence length) and H = d (head dimension)
+        B_Q, N_Q, S_Q, H_Q = Q.shape
+
+        # We want the tranposed of K
+        K_transposed = K.transpose(-2, -1) # View
+        B_K, N_K, H_K, S_K = K.shape
+        B_V, N_V, H_V, S_V = V.shape
+
+        assert B_Q == B_K
+        assert N_Q == N_K
+        assert H_Q == H_K
+
+        stride_qb, stride_qn, stride_qs, stride_qh = Q.stride()
+        stride_kb, stride_kn, stride_kh, stride_ks = K.stride()
+        stride_vb, stride_vn, stride_vh, stride_vs = K.stride()
+
+        output = torch.empty((B_Q, N_Q, S_Q, H_Q), dtype=Q.dtype, device=Q.device)
+        stride_ob, stride_on, stride_oqs, stride_oks = output.stride()
+
+        # Since each program is responsible for BLOCK_Q query tokens and their complete attention output over all keys
+        M = # MB // sizeof(type) 
+        BLOCK_Q = triton.cdiv(M, 4 * H_Q) # B_r is the number of query rows in one Q Block
+        BLOCK_KV = triton.cdiv(M, 4 * H_Q) # B_c is the number of key/value rows in one K/V Block
+        # Tile is the number of those blocks required to cover the sequence
+        TILE_Q = trition.cdiv( B_N / BLOCK_Q) # T_r
+        TILE_KV = trition.cdiv( B_N / BLOCK_R) # T_c
+
+        grid = (B_Q * N_Q, TILE_Q)
+        #M = # MB // sizeof(type) 
+
+        return output
+
+    def flash_attention_backward_kernel():
         pass
 
-    def scaled_dot_product_attn_flash():
+    def flash_attention_backward():
         pass
