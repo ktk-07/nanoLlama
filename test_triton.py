@@ -315,10 +315,13 @@ else:
         rows_block_mask = rows < row
 
         # Accumulator should just be BLOCK_Q x HEAD_DIM
-        final_acc = tl.zeros((BLOCK_Q, col), dtype=tl.float32)
+        final_acc = tl.zeros((BLOCK_Q, BLOCK_INNER_DIM), dtype=tl.float32)
+        global_max = tl.full((BLOCK_Q, ), float("-inf"), dtype=tl.float32)
+        global_denominator = tl.zeros((BLOCK_Q, ),dtype=tl.float32) # It is just the unweighted 
         # We want to do the kernel fusion for the entire inner_dim reight?
-        for j in range(0, col, BLOCK_KV):
-            cols = i + tl.arange(0,BLOCK_KV)
+        # Both matmuls happen inside the same K/V-loop iteration.
+        for j in tl.range(0, col, BLOCK_KV):
+            cols = j + tl.arange(0,BLOCK_KV)
             cols_block_mask = cols < col
 
             # Accumulator should it be BLOCK_Q by BLOCK_KV or just BLOCK_Q x 1
@@ -328,26 +331,47 @@ else:
             # Im not going to optimise it first with like group ordering, i think we would have to somehow change the way we traverse a loop?
 
             # We want to do the kernel fusion for the entire inner_dim right?
-            for k in range(0, inner_dim, BLOCK_INNER_DIM):
+            for k in tl.range(0, inner_dim, BLOCK_INNER_DIM):
                 inner = i + tl.arange(0,BLOCK_INNER_DIM);
                 inner_block_mask = inner < inner_dim
 
                 row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
                 col_mask =  cols_block_mask[None,:] & inner_block_mask[:,None]
 
-                row_idxes = q_base_offset + row[:,None] * stride_qs + inner[None,:] * stride_qh
-                col_idxes = k_base_offset + col[None,:] * stride_ks + inner[:,None] * stride_kh
+                row_idxes = q_base_offset + rows[:,None] * stride_qs + inner[None,:] * stride_qh
+                col_idxes = k_base_offset + cols[None,:] * stride_ks + inner[:,None] * stride_kh
 
-                q =  tl.load( q_base_offset + row_idxes, mask=row_mask, other=0.0)
-                k_transposed = tl.load(k_base_offset + col_idxes, mask=col_mask, other=0.0)
-                matmul_acc += tl.dot(q,k_transposed, input_precision="IEEE")
+                q =  tl.load( row_idxes, mask=row_mask, other=0.0)
+                k_transposed = tl.load( col_idxes, mask=col_mask, other=0.0)
+                matmul_acc += tl.dot(q,k_transposed, input_precision="ieee")
+
+            # Need to scaled by sqrt of dimensions
+
+            matmul_acc /= tl.sqrt(inner_dim)
 
             # 3 Running Statistic/States to Keep, technically 6 cause 3 for local then 3 for global meaning the entire 1 x embedding_dim row
             # 1. runnning max
             # 2. running denominator
             # 3. running unnormalized weighted values
 
-            # Soft max
+            # Getting the local max of the row, BLOCK_Q X 1
+            local_max = tl.max(matmul_acc, axis=-1) 
+            # Get the running denominator
+            local_denominator +=  local_denominator * tl.exp(local_max - global_max) + tl.sum(tl.exp(matmul_acc - local_max), axis=-1)
+            global_max = tl.maximum(global_max,local_max)
+
+            # Matmul PV
+            matmul_acc_pv = tl.zeros((BLOCK_Q, BLOCK_KV), dtype=tl.float32)
+            v_cols = tl.zeros((BLOCK_KV,BLOCK_Q), dtype=tl.float32)
+            v = tl.load( v_base_offset + v_idxes, mask=v_mask, other=0.0) 
+                
+            matmul_acc_pv += tl.dot(p,v)
+
+
+        # We want to write to o here
+
+        tl.load(o_base_offset+ o_idxes)
+        global_denominator += local_denominator * tl.exp(global_max) + (local_max - global_max) 
 
 
 
