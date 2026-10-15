@@ -288,8 +288,8 @@ else:
                           inner_dim,
                           stride_qb, stride_qn, stride_qs, stride_qh,
                           stride_kb, stride_kn, stride_kh, stride_ks,
-                          stride_vb, stride_vn, stride_vh, stride_vs,
-                          stride_ob, stride_on, stride_oqs, stride_oks,
+                          stride_vb, stride_vn, stride_vs, stride_vh,
+                          stride_ob, stride_on, stride_os, stride_oh,
 
                           BLOCK_Q: tl.constexpr,
                           BLOCK_KV: tl.constexpr,
@@ -317,7 +317,7 @@ else:
         # Accumulator should just be BLOCK_Q x HEAD_DIM
         final_acc = tl.zeros((BLOCK_Q, BLOCK_INNER_DIM), dtype=tl.float32)
         global_max = tl.full((BLOCK_Q, ), float("-inf"), dtype=tl.float32)
-        global_denominator = tl.zeros((BLOCK_Q, ),dtype=tl.float32) # It is just the unweighted 
+        global_denominator = tl.zeros((BLOCK_Q, ),dtype=tl.float32)
         # We want to do the kernel fusion for the entire inner_dim reight?
         # Both matmuls happen inside the same K/V-loop iteration.
         for j in tl.range(0, col, BLOCK_KV):
@@ -329,53 +329,74 @@ else:
             matmul_acc = tl.zeros((BLOCK_Q,BLOCK_KV), dtype=tl.float32)
             # Matmul one BLOCK_Q of QK^T first
             # Im not going to optimise it first with like group ordering, i think we would have to somehow change the way we traverse a loop?
-
             # We want to do the kernel fusion for the entire inner_dim right?
-            for k in tl.range(0, inner_dim, BLOCK_INNER_DIM):
-                inner = i + tl.arange(0,BLOCK_INNER_DIM);
-                inner_block_mask = inner < inner_dim
 
-                row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
-                col_mask =  cols_block_mask[None,:] & inner_block_mask[:,None]
+            # Matmul + Online Softmax in this loop 
+            # Online Softmax, need update max, deminator, unormalised accumulator
+            # Removed Inner loop due to that fact that BLOCK_INNER_DIM > inner_dim (always for flash attention)
 
-                row_idxes = q_base_offset + rows[:,None] * stride_qs + inner[None,:] * stride_qh
-                col_idxes = k_base_offset + cols[None,:] * stride_ks + inner[:,None] * stride_kh
+            # We can move this block
+            inner = tl.arange(0,BLOCK_INNER_DIM)
+            inner_block_mask = inner < inner_dim
 
-                q =  tl.load( row_idxes, mask=row_mask, other=0.0)
-                k_transposed = tl.load( col_idxes, mask=col_mask, other=0.0)
-                matmul_acc += tl.dot(q,k_transposed, input_precision="ieee")
+            row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
+            col_mask =  cols_block_mask[None,:] & inner_block_mask[:,None]
 
-            # Need to scaled by sqrt of dimensions
+            row_idxes = q_base_offset + rows[:,None] * stride_qs + inner[None,:] * stride_qh
+            col_idxes = k_base_offset + cols[None,:] * stride_ks + inner[:,None] * stride_kh
+            ##
 
-            matmul_acc /= tl.sqrt(inner_dim)
+            q =  tl.load( q_ptr + row_idxes, mask=row_mask, other=0.0)
+            k_transposed = tl.load( k_ptr + col_idxes, mask=col_mask, other=0.0)
+            matmul_acc += tl.dot(q,k_transposed, input_precision="ieee")
 
-            # 3 Running Statistic/States to Keep, technically 6 cause 3 for local then 3 for global meaning the entire 1 x embedding_dim row
+            # Attention Scaling by sqrt of dimensions
+            matmul_acc = matmul_acc * (1.0 / tl.sqrt(inner_dim))
+            # We need this because final K/V block may contain fewer than BLOCK_KV valid keys.
+            matmul_acc = tl.where(cols_block_mask[None, :],matmul_acc,-float("inf"))
+
+            # Online Rescaling 3 Running Statistic/States to Keep, technically 6 cause 3 for local then 3 for global meaning the entire 1 x embedding_dim row
+            # I think 3 Running Statisic is fine because block_inner_dim > inner_dim so there is no inner loop for block_inner_dim
             # 1. runnning max
             # 2. running denominator
             # 3. running unnormalized weighted values
 
             # Getting the local max of the row, BLOCK_Q X 1
             local_max = tl.max(matmul_acc, axis=-1) 
-            # Get the running denominator
-            local_denominator +=  local_denominator * tl.exp(local_max - global_max) + tl.sum(tl.exp(matmul_acc - local_max), axis=-1)
-            global_max = tl.maximum(global_max,local_max)
 
-            # Matmul PV
-            matmul_acc_pv = tl.zeros((BLOCK_Q, BLOCK_KV), dtype=tl.float32)
-            v_cols = tl.zeros((BLOCK_KV,BLOCK_Q), dtype=tl.float32)
-            v = tl.load( v_base_offset + v_idxes, mask=v_mask, other=0.0) 
-                
-            matmul_acc_pv += tl.dot(p,v)
+            # Rescale old statistic, denominator and accumulator with (new_max and global_max which we have not updated)
+            rescaling_factor = tl.exp(global_max - new_max)
+            new_max = tl.maximum(global_max, local_max)
+            global_denominator *= rescaling_factor
+            final_acc *= rescaling_factor[:, None]
 
+            # Update global_max
+            global_max = new_max
 
-        # We want to write to o here
+            # Accumulate the value into the global denominator
+            # p = tl.exp(matmul_acc - global_max[:, None]), i dont really want to initallise this im afraid it might use registers
+            matmul_acc = tl.exp(matmul_acc - global_max[:, None])
+            global_denominator += tl.sum(matmul_acc, axis=-1)
 
-        tl.load(o_base_offset+ o_idxes)
-        global_denominator += local_denominator * tl.exp(global_max) + (local_max - global_max) 
+            # Compute P @ V_j [BLOCK_Q,BLOCK_INNER_DIM]
+            v_inner = tl.arange(0, BLOCK_INNER_DIM)
+            v_inner_mask =  v_inner < inner_dim
+            v_mask = cols_block_mask[:, None] & v_inner_mask[None, :]
 
+            v_idxes = v_base_offset + cols[:, None] * stride_vs + v_inner[None, :] * stride_vh
 
+            v = tl.load( v_ptr + v_idxes, mask=v_mask, other=0.0) 
+            # This is the local accumulator
+            final_acc += tl.dot(matmul_acc.to(v.dtype), input_precision="ieee")
 
-
+        # We want to write to O here outside the K/V loop
+        # We need to divide unnormalised A by the global deminator
+        # We now have the global max
+        # We now have the final weighted unnormalised accumulated values
+        o_mask = rows_block_mask[:, None] & inner_block_mask[None, :]
+        o_idxes = o_base_offset + rows[:, None] * stride_os + inner[None, :] * stride_oh
+        o = tl.load(output_ptr + o_idxes, mask=o_mask, other=0.0)
+        tl.store(o_base_offset+ o_idxes, o + final_acc / global_denominator)
 
     # Compare Speed of softmax in pytorch and triton
     def flash_attn(Q,
@@ -407,8 +428,8 @@ else:
         BLOCK_Q = triton.cdiv(M, 4 * H_Q) # B_r is the number of query rows in one Q Block
         BLOCK_KV = triton.cdiv(M, 4 * H_Q) # B_c is the number of key/value rows in one K/V Block
         # Tile is the number of those blocks required to cover the sequence
-        TILE_Q = trition.cdiv( B_N / BLOCK_Q) # T_r
-        TILE_KV = trition.cdiv( B_N / BLOCK_R) # T_c
+        TILE_Q = triton.cdiv( B_N, BLOCK_Q) # T_r
+        TILE_KV = triton.cdiv( B_N, BLOCK_R) # T_c
 
         grid = (B_Q * N_Q, TILE_Q)
         #M = # MB // sizeof(type) 
