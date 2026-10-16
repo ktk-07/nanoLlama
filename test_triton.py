@@ -1,5 +1,6 @@
 import torch
 from torch.utils._triton import has_triton
+import math
 
 # Brief Recap of Implementing FlashAttention
 # 1. Online normalizer calculation for softmax
@@ -278,10 +279,12 @@ else:
     # We will do it without accomodating the mask first
     # 1 triton program owns one block of query tokens for one batch_head pair
     # Each program is responsible for BLOCK_Q query tokens and their complete attention output over all keys
-    def flash_attn_kernel(q_ptr,
+    @triton.jit
+    def dense_flash_attn_kernel(q_ptr,
                           k_ptr, # this is the k_tranposed, not too sure if thats how they are doing it
                           v_ptr,
                           output_ptr,
+                          softmax_scale,
                           N,
                           row,
                           col,
@@ -351,7 +354,8 @@ else:
             matmul_acc += tl.dot(q,k_transposed, input_precision="ieee")
 
             # Attention Scaling by sqrt of dimensions
-            matmul_acc = matmul_acc * (1.0 / tl.sqrt(inner_dim))
+            # softmax_scale computed outside kernel, preventing runtime type problems
+            matmul_acc = matmul_acc * softmax_scale
             # We need this because final K/V block may contain fewer than BLOCK_KV valid keys.
             matmul_acc = tl.where(cols_block_mask[None, :],matmul_acc,-float("inf"))
 
@@ -399,7 +403,7 @@ else:
         tl.store(output_ptr + o_idxes, output, mask=o_mask)
 
     # Compare Speed of softmax in pytorch and triton
-    def flash_attn(Q, K, V):
+    def dense_flash_attn(Q, K, V):
 
         # In the paper S = N (sequence length) and H = d (head dimension)
         # Q: [B, N, S_Q, H]
@@ -462,6 +466,9 @@ else:
         # Pad to a power of 2 because tl.arange requires it.
         BLOCK_INNER_DIM = max(16, triton.next_power_of_2(H_Q))
 
+        # Compute softmax scale 
+        softmax_scale = 1.0 / math.sqrt(H_Q)
+
         # Tile is the number of blocks required to cover the sequence.
         TILE_Q = triton.cdiv(S_Q, BLOCK_Q)   # T_r
         TILE_KV = triton.cdiv(S_K, BLOCK_KV)  # T_c
@@ -471,11 +478,12 @@ else:
         # TILE_KV is handled by the K/V loop inside the kernel.
         grid = (B_Q * N_Q, TILE_Q)
 
-        flash_attn_kernel[grid](
+        dense_flash_attn_kernel[grid](
             Q,
             K_transposed,
             V,
             output,
+            softmax_scale,
 
             N_Q,
             S_Q,       # row = Q sequence length
@@ -494,6 +502,11 @@ else:
 
         return output
 
+    def flash_attention():
+        pass
+
+    def flash_attention():
+        pass
 
     def flash_attention_backward_kernel():
         pass
@@ -502,5 +515,82 @@ else:
         pass
 
 
+    # Testing FlashAttention Forward
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if device == "cuda":
+        torch.manual_seed(42)
 
+        dtype = torch.float32
+
+        # (B, N, S_Q, S_KV, H)
+        # Test different batch sizes, heads, sequence lengths,
+        # and head dimensions.
+        test_cases = [
+            (1, 1, 32, 32, 32),
+            (1, 1, 64, 64, 64),
+            (1, 1, 128, 128, 64),
+            (1, 1, 130, 130, 64),   # Non-divisible sequence length
+            (1, 1, 257, 257, 64),   # Partial Q and K/V blocks
+            (2, 4, 128, 128, 64),   # Multiple batches and heads
+            (2, 8, 256, 256, 64),
+            (1, 2, 128, 192, 64),   # Different Q and K/V lengths
+            (1, 2, 65, 97, 32),
+            (1, 2, 129, 129, 80),   # Head dimension padding
+        ]
+
+        print("FlashAttention Forward Correctness Tests")
+        print("-" * 100)
+
+        for B, N, S_Q, S_KV, H in test_cases:
+
+            Q = torch.randn(
+                B, N, S_Q, H, device=device, dtype=dtype
+            )
+            K = torch.randn(
+                B, N, S_KV, H, device=device, dtype=dtype
+            )
+            V = torch.randn(
+                B, N, S_KV, H, device=device, dtype=dtype
+            )
+
+            # PyTorch reference implementation
+            # Non-causal attention, no dropout
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                Q, K, V,
+                dropout_p=0.0,
+                is_causal=False
+            )
+
+            # Our Triton FlashAttention forward for the dense forward
+            actual = dense_flash_attn(Q, K, V)
+
+            # Compare numerical correctness
+            max_error = (actual - reference).abs().max().item()
+            mean_error = (actual - reference).abs().mean().item()
+
+            passed = torch.allclose(
+                actual,
+                reference,
+                atol=1e-4,
+                rtol=1e-4
+            )
+
+            print(
+                f"B={B}, N={N}, "
+                f"S_Q={S_Q}, S_KV={S_KV}, H={H} | "
+                f"{'PASS' if passed else 'FAIL'} | "
+                f"Max Error: {max_error:.6e} | "
+                f"Mean Error: {mean_error:.6e}"
+            )
+
+            assert passed, (
+                f"FlashAttention failed for "
+                f"B={B}, N={N}, S_Q={S_Q}, S_KV={S_KV}, H={H}"
+            )
+
+        print("-" * 100)
+        print("All FlashAttention forward correctness tests passed!")
+
+    else:
+        print("CUDA is not available. Skipping Triton FlashAttention tests.")
