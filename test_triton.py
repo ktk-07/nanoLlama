@@ -294,8 +294,8 @@ else:
                           BLOCK_Q: tl.constexpr,
                           BLOCK_KV: tl.constexpr,
                           BLOCK_INNER_DIM: tl.constexpr, 
-                          TILE_Q: tl.constexpr, # T_r
-                          TILE_KV: tl.constexpr, # T_c
+                          #TILE_Q: tl.constexpr, # T_r not used as it is handled by launch grid
+                          #TILE_KV: tl.constexpr, # T_c not used as it is handled by K/V loop
                           ):
 
         pid0 = tl.program_id(axis=0)
@@ -311,8 +311,17 @@ else:
         v_base_offset = b_idx * stride_vb +  n_idx * stride_vn
         o_base_offset = b_idx * stride_ob +  n_idx * stride_on
 
+        # We can compute the row outside cause the inner loop is only for K/V
         rows = pid1 * BLOCK_Q + tl.arange(0, BLOCK_Q)
         rows_block_mask = rows < row
+
+        # Inner Loop K/V Loop does not use this
+        inner = tl.arange(0,BLOCK_INNER_DIM)
+        inner_block_mask = inner < inner_dim
+
+        row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
+        row_idxes = q_base_offset + rows[:,None] * stride_qs + inner[None,:] * stride_qh
+        q =  tl.load( q_ptr + row_idxes, mask=row_mask, other=0.0)
 
         # Accumulator should just be BLOCK_Q x HEAD_DIM
         final_acc = tl.zeros((BLOCK_Q, BLOCK_INNER_DIM), dtype=tl.float32)
@@ -335,18 +344,9 @@ else:
             # Online Softmax, need update max, deminator, unormalised accumulator
             # Removed Inner loop due to that fact that BLOCK_INNER_DIM > inner_dim (always for flash attention)
 
-            # We can move this block
-            inner = tl.arange(0,BLOCK_INNER_DIM)
-            inner_block_mask = inner < inner_dim
-
-            row_mask = rows_block_mask[:,None] & inner_block_mask[None,:]
             col_mask =  cols_block_mask[None,:] & inner_block_mask[:,None]
-
-            row_idxes = q_base_offset + rows[:,None] * stride_qs + inner[None,:] * stride_qh
             col_idxes = k_base_offset + cols[None,:] * stride_ks + inner[:,None] * stride_kh
-            ##
 
-            q =  tl.load( q_ptr + row_idxes, mask=row_mask, other=0.0)
             k_transposed = tl.load( k_ptr + col_idxes, mask=col_mask, other=0.0)
             matmul_acc += tl.dot(q,k_transposed, input_precision="ieee")
 
@@ -365,8 +365,8 @@ else:
             local_max = tl.max(matmul_acc, axis=-1) 
 
             # Rescale old statistic, denominator and accumulator with (new_max and global_max which we have not updated)
-            rescaling_factor = tl.exp(global_max - new_max)
             new_max = tl.maximum(global_max, local_max)
+            rescaling_factor = tl.exp(global_max - new_max)
             global_denominator *= rescaling_factor
             final_acc *= rescaling_factor[:, None]
 
@@ -387,57 +387,120 @@ else:
 
             v = tl.load( v_ptr + v_idxes, mask=v_mask, other=0.0) 
             # This is the local accumulator
-            final_acc += tl.dot(matmul_acc.to(v.dtype), input_precision="ieee")
+            final_acc += tl.dot(matmul_acc.to(v.dtype), v, input_precision="ieee")
 
         # We want to write to O here outside the K/V loop
         # We need to divide unnormalised A by the global deminator
         # We now have the global max
         # We now have the final weighted unnormalised accumulated values
-        o_mask = rows_block_mask[:, None] & inner_block_mask[None, :]
+        o_mask = rows_block_mask[:, None] & inner_block_mask[None, :] # Not needed
         o_idxes = o_base_offset + rows[:, None] * stride_os + inner[None, :] * stride_oh
-        o = tl.load(output_ptr + o_idxes, mask=o_mask, other=0.0)
-        tl.store(o_base_offset+ o_idxes, o + final_acc / global_denominator)
+        output = final_acc / global_denominator[:, None]
+        tl.store(output_ptr + o_idxes, output, mask=o_mask)
 
     # Compare Speed of softmax in pytorch and triton
-    def flash_attn(Q,
-                   K,
-                   V
-                   ):
+    def flash_attn(Q, K, V):
 
         # In the paper S = N (sequence length) and H = d (head dimension)
+        # Q: [B, N, S_Q, H]
+        # K: [B, N, S_KV, H]
+        # V: [B, N, S_KV, H]
+
         B_Q, N_Q, S_Q, H_Q = Q.shape
+        B_K, N_K, S_K, H_K = K.shape
+        B_V, N_V, S_V, H_V = V.shape
 
-        # We want the tranposed of K
-        K_transposed = K.transpose(-2, -1) # View
-        B_K, N_K, H_K, S_K = K.shape
-        B_V, N_V, H_V, S_V = V.shape
+        assert B_Q == B_K == B_V
+        assert N_Q == N_K == N_V
+        assert H_Q == H_K == H_V
+        assert S_K == S_V
 
-        assert B_Q == B_K
-        assert N_Q == N_K
-        assert H_Q == H_K
+        # We want the transposed view of K
+        # Original K:   [B, N, S_K, H]
+        # Transposed K: [B, N, H, S_K]
+        # Transpose returns a view, so we must use its actual strides.
+        K_transposed = K.transpose(-2, -1)
 
+        # Explicitly extract strides for educational purposes.
+        # Memory address = base pointer + sum(index_i * stride_i)
+        #
+        # Q[b,n,s,h] -> b*stride_qb + n*stride_qn + s*stride_qs + h*stride_qh
         stride_qb, stride_qn, stride_qs, stride_qh = Q.stride()
-        stride_kb, stride_kn, stride_kh, stride_ks = K.stride()
-        stride_vb, stride_vn, stride_vh, stride_vs = K.stride()
 
-        output = torch.empty((B_Q, N_Q, S_Q, H_Q), dtype=Q.dtype, device=Q.device)
-        stride_ob, stride_on, stride_oqs, stride_oks = output.stride()
+        # K_transposed[b,n,h,s] -> b*stride_kb + n*stride_kn + h*stride_kh + s*stride_ks
+        stride_kb, stride_kn, stride_kh, stride_ks = K_transposed.stride()
 
-        # Since each program is responsible for BLOCK_Q query tokens and their complete attention output over all keys
-        M = # MB // sizeof(type) 
-        BLOCK_Q = triton.cdiv(M, 4 * H_Q) # B_r is the number of query rows in one Q Block
-        BLOCK_KV = triton.cdiv(M, 4 * H_Q) # B_c is the number of key/value rows in one K/V Block
-        # Tile is the number of those blocks required to cover the sequence
-        TILE_Q = triton.cdiv( B_N, BLOCK_Q) # T_r
-        TILE_KV = triton.cdiv( B_N, BLOCK_R) # T_c
+        # V[b,n,s,h] -> b*stride_vb + n*stride_vn + s*stride_vs + h*stride_vh
+        stride_vb, stride_vn, stride_vs, stride_vh = V.stride()
 
+        output = torch.empty(
+            (B_Q, N_Q, S_Q, H_Q),
+            dtype=Q.dtype,
+            device=Q.device
+        )
+
+        # Output has the same logical shape as Q: [B, N, S_Q, H]
+        stride_ob, stride_on, stride_os, stride_oh = output.stride()
+
+        # Since each program is responsible for BLOCK_Q query tokens
+        # and their complete attention output over all keys. 
+        # Original FlashAttention paper:
+        # M = available SRAM capacity (number of elements)
+        # B_r = number of query rows in one Q block
+        # B_c = number of K/V rows in one K/V block
+        #
+        # Paper uses:
+        # B_c = ceil(M / (4*d))
+        # B_r = min(ceil(M / (4*d)), d)
+        #
+        # For now, choose fixed block sizes for correctness testing.
+        # Later we can tune them based on SRAM usage and performance.
+        BLOCK_Q = 32       # B_r
+        BLOCK_KV = 32      # B_c
+
+        # Head dimension is processed in full.
+        # Pad to a power of 2 because tl.arange requires it.
+        BLOCK_INNER_DIM = max(16, triton.next_power_of_2(H_Q))
+
+        # Tile is the number of blocks required to cover the sequence.
+        TILE_Q = triton.cdiv(S_Q, BLOCK_Q)   # T_r
+        TILE_KV = triton.cdiv(S_K, BLOCK_KV)  # T_c
+
+        # Each program owns one Q block for one batch/head pair.
+        # TILE_Q is handled by the launch grid.
+        # TILE_KV is handled by the K/V loop inside the kernel.
         grid = (B_Q * N_Q, TILE_Q)
-        #M = # MB // sizeof(type) 
+
+        flash_attn_kernel[grid](
+            Q,
+            K_transposed,
+            V,
+            output,
+
+            N_Q,
+            S_Q,       # row = Q sequence length
+            S_K,       # col = K/V sequence length
+            H_Q,       # inner_dim = head dimension
+
+            stride_qb, stride_qn, stride_qs, stride_qh,
+            stride_kb, stride_kn, stride_kh, stride_ks,
+            stride_vb, stride_vn, stride_vs, stride_vh,
+            stride_ob, stride_on, stride_os, stride_oh,
+
+            BLOCK_Q=BLOCK_Q,
+            BLOCK_KV=BLOCK_KV,
+            BLOCK_INNER_DIM=BLOCK_INNER_DIM,
+        )
 
         return output
+
 
     def flash_attention_backward_kernel():
         pass
 
     def flash_attention_backward():
         pass
+
+
+
+
