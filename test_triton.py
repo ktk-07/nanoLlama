@@ -383,11 +383,9 @@ else:
             global_denominator += tl.sum(matmul_acc, axis=-1)
 
             # Compute P @ V_j [BLOCK_Q,BLOCK_INNER_DIM]
-            v_inner = tl.arange(0, BLOCK_INNER_DIM)
-            v_inner_mask =  v_inner < inner_dim
-            v_mask = cols_block_mask[:, None] & v_inner_mask[None, :]
+            v_mask = cols_block_mask[:, None] & inner_block_mask[None, :]
 
-            v_idxes = v_base_offset + cols[:, None] * stride_vs + v_inner[None, :] * stride_vh
+            v_idxes = v_base_offset + cols[:, None] * stride_vs + inner[None, :] * stride_vh
 
             v = tl.load( v_ptr + v_idxes, mask=v_mask, other=0.0) 
             # This is the local accumulator
